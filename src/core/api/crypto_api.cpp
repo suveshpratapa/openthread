@@ -64,6 +64,9 @@ void otCryptoAesCcm(const otCryptoKey *aKey,
                     bool               aEncrypt,
                     void              *aTag)
 {
+    // `aTag` is always treated as an output buffer; the caller compares the returned MIC against its expected value
+    // externally on decrypt. Callers that need internal MIC verification (required for the platform AES-CCM* path with
+    // a PSA backend, which cannot expose the computed MIC after a decrypt operation) should use `otCryptoAesCcmVerify`.
     AesCcm aesCcm;
 
     AssertPointerIsNotNull(aNonce);
@@ -72,7 +75,8 @@ void otCryptoAesCcm(const otCryptoKey *aKey,
     AssertPointerIsNotNull(aTag);
 
     aesCcm.SetKey(AsCoreType(aKey));
-    aesCcm.Init(aHeaderLength, aLength, aTagLength, aNonce, aNonceLength);
+    aesCcm.Init(aHeaderLength, aLength, aTagLength, aNonce, aNonceLength,
+                aEncrypt ? AesCcm::kEncrypt : AesCcm::kDecrypt);
 
     if (aHeaderLength != 0)
     {
@@ -82,4 +86,36 @@ void otCryptoAesCcm(const otCryptoKey *aKey,
 
     aesCcm.Payload(aPlainText, aCipherText, aLength, aEncrypt ? AesCcm::kEncrypt : AesCcm::kDecrypt);
     aesCcm.Finalize(aTag);
+}
+
+otError otCryptoAesCcmVerify(const otCryptoKey *aKey,
+                             uint8_t            aTagLength,
+                             const void        *aNonce,
+                             uint8_t            aNonceLength,
+                             const void        *aHeader,
+                             uint32_t           aHeaderLength,
+                             void              *aPlainText,
+                             void              *aCipherText,
+                             uint32_t           aLength,
+                             const void        *aExpectedTag)
+{
+    AesCcm aesCcm;
+
+    AssertPointerIsNotNull(aNonce);
+    AssertPointerIsNotNull(aPlainText);
+    AssertPointerIsNotNull(aCipherText);
+    AssertPointerIsNotNull(aExpectedTag);
+
+    aesCcm.SetKey(AsCoreType(aKey));
+    aesCcm.Init(aHeaderLength, aLength, aTagLength, aNonce, aNonceLength, AesCcm::kDecrypt);
+
+    if (aHeaderLength != 0)
+    {
+        OT_ASSERT(aHeader != nullptr);
+        aesCcm.Header(aHeader, aHeaderLength);
+    }
+
+    aesCcm.Payload(aPlainText, aCipherText, aLength, AesCcm::kDecrypt);
+
+    return aesCcm.Verify(aExpectedTag);
 }

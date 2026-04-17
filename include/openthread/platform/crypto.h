@@ -440,6 +440,157 @@ otError otPlatCryptoAesEncrypt(otCryptoContext *aContext, const uint8_t *aInput,
 otError otPlatCryptoAesFree(otCryptoContext *aContext);
 
 /**
+ * @defgroup plat-crypto-aes-ccm AES-CCM* multipart operations
+ *
+ * The AES-CCM* APIs below form a multipart operation: a single operation is composed of `otPlatCryptoAesCcmStart()`,
+ * followed by zero or more `otPlatCryptoAesCcmHeaderUpdate()` calls totalling `aHeaderLength` bytes, zero or more
+ * `otPlatCryptoAesCcmPayloadUpdate()` calls totalling `aPayloadLength` bytes, and finally either
+ * `otPlatCryptoAesCcmFinalize()` (for encrypt) or `otPlatCryptoAesCcmVerify()` (for decrypt). A context may be reused
+ * for additional operations by calling `otPlatCryptoAesCcmStart()` again. Each context must be initialised with
+ * `otPlatCryptoAesCcmInit()` before use and released with `otPlatCryptoAesCcmDeinit()` when no longer needed.
+ *
+ * The OpenThread core invokes these APIs in the order above. Platform implementations may rely on this and are not
+ * required to detect or recover from out-of-order calls.
+ *
+ * @{
+ */
+
+/**
+ * Initialise the AES-CCM* multipart operation context.
+ *
+ * @param[in]  aContext           Context for AES-CCM* operation.
+ *
+ * @retval OT_ERROR_NONE          Successfully initialised the AES-CCM* context.
+ * @retval OT_ERROR_FAILED        Failed to initialise the AES-CCM* context.
+ * @retval OT_ERROR_INVALID_ARGS  @p aContext was NULL.
+ *
+ * @note If `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_ALLOCS_CONTEXT` is enabled, @p aContext is populated by the platform.
+ *       Otherwise OpenThread core allocates and populates it.
+ *
+ * @note The platform driver shall point the context to the correct object such as `psa_aead_operation_t` or
+ *       `mbedtls_ccm_context`.
+ *
+ * @note This API is only used by OT core when `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE` is enabled.
+ */
+otError otPlatCryptoAesCcmInit(otCryptoContext *aContext);
+
+/**
+ * Uninitialise the AES-CCM* multipart operation context.
+ *
+ * @param[in]  aContext           Context for AES-CCM* operation.
+ *
+ * @retval OT_ERROR_NONE          Successfully uninitialised the AES-CCM* context.
+ * @retval OT_ERROR_FAILED        Failed to uninitialise the AES-CCM* context.
+ * @retval OT_ERROR_INVALID_ARGS  @p aContext was NULL.
+ *
+ * @note This API is only used by OT core when `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE` is enabled.
+ */
+otError otPlatCryptoAesCcmDeinit(otCryptoContext *aContext);
+
+/**
+ * Begin a new AES-CCM* multipart encrypt or decrypt operation.
+ *
+ * Sets the key, nonce, tag length, and total header/payload lengths for the upcoming operation.
+ *
+ * @param[in]  aContext           Context for AES-CCM* operation.
+ * @param[in]  aKey               Key material to use for the operation.
+ * @param[in]  aEncrypt           `true` for encrypt-and-tag, `false` for decrypt-and-verify.
+ * @param[in]  aHeaderLength      Total length of additional authenticated data (header) in bytes.
+ * @param[in]  aPayloadLength     Total length of payload (plaintext or ciphertext) in bytes.
+ * @param[in]  aTagLength         MIC length in bytes (4, 8, or 16).
+ * @param[in]  aNonce             A pointer to the nonce.
+ * @param[in]  aNonceLength       Length of @p aNonce in bytes (13 for IEEE 802.15.4 CCM*).
+ *
+ * @retval OT_ERROR_NONE          Successfully started the AES-CCM* operation.
+ * @retval OT_ERROR_FAILED        Failed to start the AES-CCM* operation.
+ * @retval OT_ERROR_INVALID_ARGS  @p aContext, @p aKey, or @p aNonce was NULL.
+ *
+ * @note This API is only used by OT core when `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE` is enabled.
+ */
+otError otPlatCryptoAesCcmStart(otCryptoContext   *aContext,
+                                const otCryptoKey *aKey,
+                                bool               aEncrypt,
+                                uint32_t           aHeaderLength,
+                                uint32_t           aPayloadLength,
+                                uint8_t            aTagLength,
+                                const uint8_t     *aNonce,
+                                uint8_t            aNonceLength);
+
+/**
+ * Feed an additional authenticated data (header) chunk into the AES-CCM* operation.
+ *
+ * @param[in]  aContext           Context for AES-CCM* operation.
+ * @param[in]  aHeader            A pointer to the header chunk.
+ * @param[in]  aHeaderLength      Length of @p aHeader in bytes.
+ *
+ * @retval OT_ERROR_NONE          Successfully consumed @p aHeader.
+ * @retval OT_ERROR_FAILED        Failed to consume @p aHeader.
+ * @retval OT_ERROR_INVALID_ARGS  @p aContext or @p aHeader was NULL.
+ *
+ * @note This API is only used by OT core when `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE` is enabled.
+ */
+otError otPlatCryptoAesCcmHeaderUpdate(otCryptoContext *aContext, const void *aHeader, uint32_t aHeaderLength);
+
+/**
+ * Encrypt or decrypt a payload chunk in the AES-CCM* operation.
+ *
+ * @p aInput and @p aOutput may alias for in-place processing.
+ *
+ * @param[in]  aContext           Context for AES-CCM* operation.
+ * @param[in]  aInput             A pointer to the input chunk (plaintext when encrypting, ciphertext when decrypting).
+ * @param[out] aOutput            A pointer to the output chunk (ciphertext when encrypting, plaintext when decrypting).
+ * @param[in]  aLength            Length of @p aInput and @p aOutput in bytes.
+ *
+ * @retval OT_ERROR_NONE          Successfully processed @p aInput.
+ * @retval OT_ERROR_FAILED        Failed to process @p aInput.
+ * @retval OT_ERROR_INVALID_ARGS  @p aContext, @p aInput, or @p aOutput was NULL.
+ *
+ * @note This API is only used by OT core when `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE` is enabled.
+ */
+otError otPlatCryptoAesCcmPayloadUpdate(otCryptoContext *aContext, const void *aInput, void *aOutput, uint32_t aLength);
+
+/**
+ * Finalise an AES-CCM* encrypt operation and output the MIC.
+ *
+ * Valid only for operations started with `aEncrypt=true`. For decrypt operations, use
+ * `otPlatCryptoAesCcmVerify()` instead.
+ *
+ * @param[in]  aContext           Context for AES-CCM* operation.
+ * @param[out] aTag               Buffer to receive the MIC; must be at least @p aTagLength bytes.
+ * @param[in]  aTagLength         MIC length in bytes (must match the value passed to `otPlatCryptoAesCcmStart()`).
+ *
+ * @retval OT_ERROR_NONE          Successfully wrote the MIC into @p aTag.
+ * @retval OT_ERROR_FAILED        Failed to finalise the AES-CCM* operation.
+ * @retval OT_ERROR_INVALID_ARGS  @p aContext or @p aTag was NULL.
+ *
+ * @note This API is only used by OT core when `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE` is enabled.
+ */
+otError otPlatCryptoAesCcmFinalize(otCryptoContext *aContext, void *aTag, uint8_t aTagLength);
+
+/**
+ * Finalise an AES-CCM* decrypt operation and verify the MIC against an expected value.
+ *
+ * Valid only for operations started with `aEncrypt=false`. For encrypt operations, use
+ * `otPlatCryptoAesCcmFinalize()` instead.
+ *
+ * @param[in]  aContext           Context for AES-CCM* operation.
+ * @param[in]  aExpectedTag       Expected MIC value to verify against.
+ * @param[in]  aTagLength         MIC length in bytes (must match the value passed to `otPlatCryptoAesCcmStart()`).
+ *
+ * @retval OT_ERROR_NONE          MIC verification succeeded.
+ * @retval OT_ERROR_SECURITY      MIC verification failed.
+ * @retval OT_ERROR_FAILED        Failed to finalise the AES-CCM* operation.
+ * @retval OT_ERROR_INVALID_ARGS  @p aContext or @p aExpectedTag was NULL.
+ *
+ * @note This API is only used by OT core when `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE` is enabled.
+ */
+otError otPlatCryptoAesCcmVerify(otCryptoContext *aContext, const void *aExpectedTag, uint8_t aTagLength);
+
+/**
+ * @}
+ */
+
+/**
  * Initialise the HKDF context.
  *
  * @param[in]  aContext           Context for HKDF operation.

@@ -99,6 +99,38 @@ void otCryptoAesCcm(const otCryptoKey *aKey,
                     void              *aTag);
 
 /**
+ * Performs AES CCM decryption with MIC verification.
+ *
+ * @param[in]      aKey           A pointer to the key.
+ * @param[in]      aTagLength     Length of tag in bytes.
+ * @param[in]      aNonce         A pointer to the nonce.
+ * @param[in]      aNonceLength   Length of nonce in bytes.
+ *
+ * @param[in]      aHeader        A pointer to the header.
+ * @param[in]      aHeaderLength  Length of header in bytes.
+ *
+ * @param[in,out]  aPlainText     A pointer to the plaintext output buffer.
+ * @param[in,out]  aCipherText    A pointer to the ciphertext.
+ * @param[in]      aLength        Payload length in bytes.
+ *
+ * @param[in]      aExpectedTag   A pointer to the expected tag (must be at least @p aTagLength bytes).
+ *
+ * @retval OT_ERROR_NONE      Decryption succeeded and the MIC matched @p aExpectedTag.
+ * @retval OT_ERROR_SECURITY  The MIC did not match @p aExpectedTag.
+ * @retval OT_ERROR_FAILED    The platform AES-CCM* operation failed.
+ */
+otError otCryptoAesCcmVerify(const otCryptoKey *aKey,
+                             uint8_t            aTagLength,
+                             const void        *aNonce,
+                             uint8_t            aNonceLength,
+                             const void        *aHeader,
+                             uint32_t           aHeaderLength,
+                             void              *aPlainText,
+                             void              *aCipherText,
+                             uint32_t           aLength,
+                             const void        *aExpectedTag);
+
+/**
  * @}
  */
 

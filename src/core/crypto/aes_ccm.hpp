@@ -43,6 +43,7 @@
 #include "common/message.hpp"
 #include "common/type_traits.hpp"
 #include "crypto/aes_ecb.hpp"
+#include "crypto/context_size.hpp"
 #include "crypto/storage.hpp"
 #include "mac/mac_types.hpp"
 
@@ -57,6 +58,10 @@ namespace Crypto {
 
 /**
  * Implements AES CCM computation.
+ *
+ * The expected call sequence is `SetKey()`, `Init()`, zero or more `Header()` calls totalling the header length,
+ * zero or more `Payload()` calls totalling the payload length, then either `Finalize()` (for encrypt) or
+ * `Verify()` (for decrypt).
  */
 class AesCcm
 {
@@ -66,7 +71,7 @@ public:
     static constexpr uint8_t kNonceSize    = 13;                 ///< Size of IEEE 802.15.4 Nonce (in bytes).
 
     /**
-     * Type represent the encryption vs decryption mode.
+     * Represents the encryption vs decryption mode.
      */
     enum Mode : uint8_t
     {
@@ -74,12 +79,24 @@ public:
         kDecrypt, // Decryption mode.
     };
 
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+    /**
+     * Constructor for `AesCcm`.
+     */
+    AesCcm(void);
+
+    /**
+     * Destructor for `AesCcm`.
+     */
+    ~AesCcm(void);
+#endif
+
     /**
      * Sets the key.
      *
      * @param[in]  aKey    Crypto Key used in AES operation
      */
-    void SetKey(const Key &aKey) { mEcb.SetKey(aKey); }
+    void SetKey(const Key &aKey);
 
     /**
      * Sets the key.
@@ -104,12 +121,15 @@ public:
      * @param[in]  aTagLength        Length of tag in bytes (must be even and in `[kMinTagLength, kMaxTagLength]`).
      * @param[in]  aNonce            A pointer to the nonce.
      * @param[in]  aNonceLength      Length of nonce in bytes.
+     * @param[in]  aMode             Set up the operation for `kEncrypt` or `kDecrypt`. Must match the mode passed
+     *                               to subsequent `Payload()` calls and to `Finalize()` / `Verify()`.
      */
     void Init(uint32_t    aHeaderLength,
               uint32_t    aPlainTextLength,
               uint8_t     aTagLength,
               const void *aNonce,
-              uint8_t     aNonceLength);
+              uint8_t     aNonceLength,
+              Mode        aMode);
 
     /**
      * Processes the header.
@@ -135,9 +155,6 @@ public:
 
     /**
      * Processes the payload.
-     *
-     * When decrypting (`kDecrypt`), @p aPlainText can be `nullptr` if the decrypted plaintext is not needed.
-     * Similarly, when encrypting (`kEncrypt`), @p aCipherText can be `nullptr` if the ciphertext is not needed.
      *
      * @param[in,out]  aPlainText   A pointer to the plaintext.
      * @param[in,out]  aCipherText  A pointer to the ciphertext.
@@ -168,11 +185,23 @@ public:
     uint8_t GetTagLength(void) const { return mTagLength; }
 
     /**
-     * Generates the tag.
+     * Generates the tag (use for encrypt operations).
      *
-     * @param[out]  aTag        A pointer to the tag (must have `GetTagLength()` bytes).
+     * For decrypt operations, use `Verify()` instead.
+     *
+     * @param[out]  aTag   A pointer to the tag (must have `GetTagLength()` bytes).
      */
     void Finalize(void *aTag);
+
+    /**
+     * Verifies the computed tag against an expected value (use for decrypt operations).
+     *
+     * @param[in]  aExpectedTag   A pointer to the expected tag (must have `GetTagLength()` bytes).
+     *
+     * @retval kErrorNone      The computed tag matched @p aExpectedTag.
+     * @retval kErrorSecurity  The computed tag did not match @p aExpectedTag.
+     */
+    Error Verify(const void *aExpectedTag);
 
     /**
      * Generates IEEE 802.15.4 nonce byte sequence.
@@ -188,6 +217,10 @@ public:
                               uint8_t               *aNonce);
 
 private:
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+    ContextWith<kAesCcmContextSize> mContext;
+    Key                             mKey;
+#else
     AesEcb   mEcb;
     uint8_t  mBlock[AesEcb::kBlockSize];
     uint8_t  mCtr[AesEcb::kBlockSize];
@@ -199,7 +232,8 @@ private:
     uint16_t mBlockLength;
     uint16_t mCtrLength;
     uint8_t  mNonceLength;
-    uint8_t  mTagLength;
+#endif
+    uint8_t mTagLength;
 };
 
 /**

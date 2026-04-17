@@ -1558,7 +1558,7 @@ Error Mle::ProcessMessageSecurity(Crypto::AesCcm::Mode    aMode,
                       : Get<KeyManager>().GetTemporaryMleKey(keySequence));
 
     aesCcm.Init(sizeof(Ip6::Address) + sizeof(Ip6::Address) + sizeof(SecurityHeader), payloadLength,
-                kMleSecurityTagSize, nonce, sizeof(nonce));
+                kMleSecurityTagSize, nonce, sizeof(nonce), aMode);
 
     aesCcm.Header(*senderAddress);
     aesCcm.Header(*receiverAddress);
@@ -1574,15 +1574,16 @@ Error Mle::ProcessMessageSecurity(Crypto::AesCcm::Mode    aMode,
 #endif
 
     aesCcm.Payload(aMessage, aCmdOffset, payloadLength, aMode);
-    aesCcm.Finalize(tag);
 
     if (aMode == Crypto::AesCcm::kEncrypt)
     {
+        aesCcm.Finalize(tag);
         SuccessOrExit(error = aMessage.Append(tag));
     }
     else
     {
-        VerifyOrExit(aMessage.Compare(aMessage.GetLength() - kMleSecurityTagSize, tag), error = kErrorSecurity);
+        SuccessOrExit(error = aMessage.Read(aMessage.GetLength() - kMleSecurityTagSize, tag));
+        VerifyOrExit(aesCcm.Verify(tag) == kErrorNone, error = kErrorSecurity);
         aMessage.RemoveFooter(kMleSecurityTagSize);
     }
 

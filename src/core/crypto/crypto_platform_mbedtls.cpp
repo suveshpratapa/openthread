@@ -37,6 +37,10 @@
 #include <string.h>
 
 #include <mbedtls/aes.h>
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+#include <mbedtls/ccm.h>
+#endif
+#include <mbedtls/cipher.h>
 #include <mbedtls/cmac.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/ecdsa.h>
@@ -151,6 +155,152 @@ OT_TOOL_WEAK otError otPlatCryptoAesFree(otCryptoContext *aContext)
 exit:
     return error;
 }
+
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmInit(otCryptoContext *aContext)
+{
+    Error                error = kErrorNone;
+    mbedtls_ccm_context *context;
+
+    VerifyOrExit(aContext != nullptr, error = kErrorInvalidArgs);
+    VerifyOrExit(aContext->mContextSize >= sizeof(mbedtls_ccm_context), error = kErrorFailed);
+
+    context = static_cast<mbedtls_ccm_context *>(aContext->mContext);
+    mbedtls_ccm_init(context);
+
+exit:
+    return error;
+}
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmDeinit(otCryptoContext *aContext)
+{
+    Error                error = kErrorNone;
+    mbedtls_ccm_context *context;
+
+    VerifyOrExit(aContext != nullptr, error = kErrorInvalidArgs);
+    VerifyOrExit(aContext->mContextSize >= sizeof(mbedtls_ccm_context), error = kErrorFailed);
+
+    context = static_cast<mbedtls_ccm_context *>(aContext->mContext);
+    mbedtls_ccm_free(context);
+
+exit:
+    return error;
+}
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmStart(otCryptoContext   *aContext,
+                                             const otCryptoKey *aKey,
+                                             bool               aEncrypt,
+                                             uint32_t           aHeaderLength,
+                                             uint32_t           aPayloadLength,
+                                             uint8_t            aTagLength,
+                                             const uint8_t     *aNonce,
+                                             uint8_t            aNonceLength)
+{
+    Error                error = kErrorNone;
+    mbedtls_ccm_context *context;
+    const LiteralKey     key(*static_cast<const Key *>(aKey));
+
+    VerifyOrExit(aContext != nullptr && aKey != nullptr && aNonce != nullptr, error = kErrorInvalidArgs);
+    VerifyOrExit(aContext->mContextSize >= sizeof(mbedtls_ccm_context), error = kErrorFailed);
+
+    context = static_cast<mbedtls_ccm_context *>(aContext->mContext);
+
+    // mbedtls_ccm_setkey() is idempotent; calling it on every Start() lets the same context be reused across keys.
+    VerifyOrExit(mbedtls_ccm_setkey(context, MBEDTLS_CIPHER_ID_AES, key.GetBytes(),
+                                    static_cast<unsigned int>(key.GetLength() * kBitsPerByte)) == 0,
+                 error = kErrorFailed);
+
+    VerifyOrExit(
+        mbedtls_ccm_starts(context, aEncrypt ? MBEDTLS_CCM_ENCRYPT : MBEDTLS_CCM_DECRYPT, aNonce, aNonceLength) == 0,
+        error = kErrorFailed);
+
+    VerifyOrExit(mbedtls_ccm_set_lengths(context, aHeaderLength, aPayloadLength, aTagLength) == 0,
+                 error = kErrorFailed);
+
+exit:
+    return error;
+}
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmHeaderUpdate(otCryptoContext *aContext,
+                                                    const void      *aHeader,
+                                                    uint32_t         aHeaderLength)
+{
+    Error                error = kErrorNone;
+    mbedtls_ccm_context *context;
+
+    VerifyOrExit(aContext != nullptr, error = kErrorInvalidArgs);
+    VerifyOrExit(aHeader != nullptr || aHeaderLength == 0, error = kErrorInvalidArgs);
+    VerifyOrExit(aContext->mContextSize >= sizeof(mbedtls_ccm_context), error = kErrorFailed);
+
+    context = static_cast<mbedtls_ccm_context *>(aContext->mContext);
+
+    VerifyOrExit(mbedtls_ccm_update_ad(context, static_cast<const uint8_t *>(aHeader), aHeaderLength) == 0,
+                 error = kErrorFailed);
+
+exit:
+    return error;
+}
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmPayloadUpdate(otCryptoContext *aContext,
+                                                     const void      *aInput,
+                                                     void            *aOutput,
+                                                     uint32_t         aLength)
+{
+    Error                error = kErrorNone;
+    mbedtls_ccm_context *context;
+    size_t               outputLength = 0;
+
+    VerifyOrExit(aContext != nullptr, error = kErrorInvalidArgs);
+    VerifyOrExit((aInput != nullptr && aOutput != nullptr) || aLength == 0, error = kErrorInvalidArgs);
+    VerifyOrExit(aContext->mContextSize >= sizeof(mbedtls_ccm_context), error = kErrorFailed);
+
+    context = static_cast<mbedtls_ccm_context *>(aContext->mContext);
+
+    VerifyOrExit(mbedtls_ccm_update(context, static_cast<const uint8_t *>(aInput), aLength,
+                                    static_cast<uint8_t *>(aOutput), aLength, &outputLength) == 0,
+                 error = kErrorFailed);
+
+exit:
+    return error;
+}
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmFinalize(otCryptoContext *aContext, void *aTag, uint8_t aTagLength)
+{
+    Error                error = kErrorNone;
+    mbedtls_ccm_context *context;
+
+    VerifyOrExit(aContext != nullptr && aTag != nullptr, error = kErrorInvalidArgs);
+    VerifyOrExit(aContext->mContextSize >= sizeof(mbedtls_ccm_context), error = kErrorFailed);
+
+    context = static_cast<mbedtls_ccm_context *>(aContext->mContext);
+
+    VerifyOrExit(mbedtls_ccm_finish(context, static_cast<uint8_t *>(aTag), aTagLength) == 0, error = kErrorFailed);
+
+exit:
+    return error;
+}
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmVerify(otCryptoContext *aContext, const void *aExpectedTag, uint8_t aTagLength)
+{
+    Error                error = kErrorNone;
+    mbedtls_ccm_context *context;
+    uint8_t              computedTag[16]; // AES-CCM* tag length never exceeds the AES block size of 16 bytes.
+
+    VerifyOrExit(aContext != nullptr && aExpectedTag != nullptr, error = kErrorInvalidArgs);
+    VerifyOrExit(aTagLength <= sizeof(computedTag), error = kErrorInvalidArgs);
+    VerifyOrExit(aContext->mContextSize >= sizeof(mbedtls_ccm_context), error = kErrorFailed);
+
+    context = static_cast<mbedtls_ccm_context *>(aContext->mContext);
+
+    VerifyOrExit(mbedtls_ccm_finish(context, computedTag, aTagLength) == 0, error = kErrorFailed);
+    VerifyOrExit(memcmp(computedTag, aExpectedTag, aTagLength) == 0, error = kErrorSecurity);
+
+exit:
+    return error;
+}
+
+#endif // OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
 
 #if OPENTHREAD_FTD || OPENTHREAD_MTD
 

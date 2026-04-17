@@ -48,6 +48,7 @@
 #include "common/error.hpp"
 #include "common/new.hpp"
 #include "config/crypto.h"
+#include "crypto/aes_ccm.hpp"
 #include "crypto/ecdsa.hpp"
 #include "crypto/hmac_sha256.hpp"
 #include "crypto/storage.hpp"
@@ -388,6 +389,172 @@ OT_TOOL_WEAK otError otPlatCryptoAesFree(otCryptoContext *aContext)
 
     return kErrorNone;
 }
+
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmInit(otCryptoContext *aContext)
+{
+    Error                 error = kErrorNone;
+    psa_aead_operation_t *operation;
+
+    SuccessOrExit(error = ValidateContext(aContext, sizeof(psa_aead_operation_t)));
+
+    operation = static_cast<psa_aead_operation_t *>(aContext->mContext);
+    // psa_aead_operation_init() is documented as equivalent to zeroing the struct.
+    ClearAllBytes(*operation);
+
+exit:
+    return error;
+}
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmDeinit(otCryptoContext *aContext)
+{
+    Error                 error = kErrorNone;
+    psa_aead_operation_t *operation;
+
+    SuccessOrExit(error = ValidateContext(aContext, sizeof(psa_aead_operation_t)));
+
+    operation = static_cast<psa_aead_operation_t *>(aContext->mContext);
+
+    error = PsaToOtError(psa_aead_abort(operation));
+
+exit:
+    return error;
+}
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmStart(otCryptoContext   *aContext,
+                                             const otCryptoKey *aKey,
+                                             bool               aEncrypt,
+                                             uint32_t           aHeaderLength,
+                                             uint32_t           aPayloadLength,
+                                             uint8_t            aTagLength,
+                                             const uint8_t     *aNonce,
+                                             uint8_t            aNonceLength)
+{
+    Error                 error = kErrorNone;
+    psa_status_t          status;
+    psa_aead_operation_t *operation;
+    psa_algorithm_t       algorithm = PSA_ALG_AEAD_WITH_SHORTENED_TAG(PSA_ALG_CCM, aTagLength);
+
+    SuccessOrExit(error = ValidateContext(aContext, sizeof(psa_aead_operation_t)));
+    VerifyOrExit(aKey != nullptr && aNonce != nullptr, error = kErrorInvalidArgs);
+
+    operation = static_cast<psa_aead_operation_t *>(aContext->mContext);
+
+    // Reset any prior operation state so the context is reusable across operations.
+    (void)psa_aead_abort(operation);
+
+    if (aEncrypt)
+    {
+        status = psa_aead_encrypt_setup(operation, aKey->mKeyRef, algorithm);
+    }
+    else
+    {
+        status = psa_aead_decrypt_setup(operation, aKey->mKeyRef, algorithm);
+    }
+    SuccessOrExit(error = PsaToOtError(status));
+
+    status = psa_aead_set_lengths(operation, aHeaderLength, aPayloadLength);
+    SuccessOrExit(error = PsaToOtError(status));
+
+    status = psa_aead_set_nonce(operation, aNonce, aNonceLength);
+    SuccessOrExit(error = PsaToOtError(status));
+
+exit:
+    return error;
+}
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmHeaderUpdate(otCryptoContext *aContext,
+                                                    const void      *aHeader,
+                                                    uint32_t         aHeaderLength)
+{
+    Error                 error = kErrorNone;
+    psa_aead_operation_t *operation;
+
+    SuccessOrExit(error = ValidateContext(aContext, sizeof(psa_aead_operation_t)));
+    VerifyOrExit(aHeader != nullptr || aHeaderLength == 0, error = kErrorInvalidArgs);
+
+    operation = static_cast<psa_aead_operation_t *>(aContext->mContext);
+
+    error = PsaToOtError(psa_aead_update_ad(operation, static_cast<const uint8_t *>(aHeader), aHeaderLength));
+
+exit:
+    return error;
+}
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmPayloadUpdate(otCryptoContext *aContext,
+                                                     const void      *aInput,
+                                                     void            *aOutput,
+                                                     uint32_t         aLength)
+{
+    Error                 error = kErrorNone;
+    psa_aead_operation_t *operation;
+    size_t                outputLength = 0;
+
+    SuccessOrExit(error = ValidateContext(aContext, sizeof(psa_aead_operation_t)));
+    VerifyOrExit((aInput != nullptr && aOutput != nullptr) || aLength == 0, error = kErrorInvalidArgs);
+
+    operation = static_cast<psa_aead_operation_t *>(aContext->mContext);
+
+    // For CCM, PSA may buffer until psa_aead_finish/verify; allocate worst-case output size.
+    error = PsaToOtError(psa_aead_update(operation, static_cast<const uint8_t *>(aInput), aLength,
+                                         static_cast<uint8_t *>(aOutput), aLength, &outputLength));
+
+exit:
+    return error;
+}
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmFinalize(otCryptoContext *aContext, void *aTag, uint8_t aTagLength)
+{
+    Error                 error = kErrorNone;
+    psa_status_t          status;
+    psa_aead_operation_t *operation;
+    uint8_t               trailing[AesCcm::kMaxTagLength];
+    size_t                trailingLen = 0;
+    size_t                tagLen      = 0;
+
+    SuccessOrExit(error = ValidateContext(aContext, sizeof(psa_aead_operation_t)));
+    VerifyOrExit(aTag != nullptr, error = kErrorInvalidArgs);
+
+    operation = static_cast<psa_aead_operation_t *>(aContext->mContext);
+
+    // For CCM, no trailing ciphertext is emitted by psa_aead_finish, but the API still requires a buffer.
+    status = psa_aead_finish(operation, trailing, sizeof(trailing), &trailingLen, static_cast<uint8_t *>(aTag),
+                             aTagLength, &tagLen);
+    SuccessOrExit(error = PsaToOtError(status));
+    VerifyOrExit(tagLen == aTagLength, error = kErrorFailed);
+
+exit:
+    return error;
+}
+
+OT_TOOL_WEAK otError otPlatCryptoAesCcmVerify(otCryptoContext *aContext, const void *aExpectedTag, uint8_t aTagLength)
+{
+    Error                 error = kErrorNone;
+    psa_status_t          status;
+    psa_aead_operation_t *operation;
+
+    SuccessOrExit(error = ValidateContext(aContext, sizeof(psa_aead_operation_t)));
+    VerifyOrExit(aExpectedTag != nullptr, error = kErrorInvalidArgs);
+
+    operation = static_cast<psa_aead_operation_t *>(aContext->mContext);
+
+    // psa_aead_verify still wants a plaintext output buffer for any trailing bytes; CCM emits none.
+    {
+        uint8_t trailing[AesCcm::kMaxTagLength];
+        size_t  trailingLen = 0;
+
+        status = psa_aead_verify(operation, trailing, sizeof(trailing), &trailingLen,
+                                 static_cast<const uint8_t *>(aExpectedTag), aTagLength);
+    }
+
+    error = (status == PSA_ERROR_INVALID_SIGNATURE) ? kErrorSecurity : PsaToOtError(status);
+
+exit:
+    return error;
+}
+
+#endif // OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
 
 #if OPENTHREAD_FTD || OPENTHREAD_MTD
 

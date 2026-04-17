@@ -33,12 +33,79 @@
 
 #include "aes_ccm.hpp"
 
+#include <string.h>
+
 #include "common/code_utils.hpp"
 #include "common/debug.hpp"
 #include "common/encoding.hpp"
 
 namespace ot {
 namespace Crypto {
+
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+
+AesCcm::AesCcm(void) { SuccessOrAssert(otPlatCryptoAesCcmInit(&mContext)); }
+
+AesCcm::~AesCcm(void) { SuccessOrAssert(otPlatCryptoAesCcmDeinit(&mContext)); }
+
+void AesCcm::SetKey(const Key &aKey) { mKey = aKey; }
+
+void AesCcm::SetKey(const uint8_t *aKey, uint16_t aKeyLength) { mKey.Set(aKey, aKeyLength); }
+
+void AesCcm::SetKey(const Mac::KeyMaterial &aMacKey) { aMacKey.ConvertToCryptoKey(mKey); }
+
+void AesCcm::Init(uint32_t    aHeaderLength,
+                  uint32_t    aPlainTextLength,
+                  uint8_t     aTagLength,
+                  const void *aNonce,
+                  uint8_t     aNonceLength,
+                  Mode        aMode)
+{
+    OT_ASSERT(((aTagLength & 0x1) == 0) && (kMinTagLength <= aTagLength) && (aTagLength <= kMaxTagLength));
+
+    mTagLength = aTagLength;
+
+    SuccessOrAssert(otPlatCryptoAesCcmStart(&mContext, &mKey, aMode == kEncrypt, aHeaderLength, aPlainTextLength,
+                                            aTagLength, reinterpret_cast<const uint8_t *>(aNonce), aNonceLength));
+}
+
+void AesCcm::Header(const void *aHeader, uint32_t aHeaderLength)
+{
+    SuccessOrAssert(otPlatCryptoAesCcmHeaderUpdate(&mContext, aHeader, aHeaderLength));
+}
+
+void AesCcm::Payload(void *aPlainText, void *aCipherText, uint32_t aLength, Mode aMode)
+{
+    void *input  = (aMode == kEncrypt) ? aPlainText : aCipherText;
+    void *output = (aMode == kEncrypt) ? aCipherText : aPlainText;
+
+    OT_ASSERT(input != nullptr && output != nullptr);
+
+    SuccessOrAssert(otPlatCryptoAesCcmPayloadUpdate(&mContext, input, output, aLength));
+}
+
+#if OPENTHREAD_FTD || OPENTHREAD_MTD
+void AesCcm::Payload(Message &aMessage, uint16_t aOffset, uint16_t aLength, Mode aMode)
+{
+    Message::MutableChunk chunk;
+
+    aMessage.GetFirstChunk(aOffset, aLength, chunk);
+
+    while (chunk.GetLength() > 0)
+    {
+        Payload(chunk.GetBytes(), chunk.GetBytes(), chunk.GetLength(), aMode);
+        aMessage.GetNextChunk(aLength, chunk);
+    }
+}
+#endif
+
+void AesCcm::Finalize(void *aTag) { SuccessOrAssert(otPlatCryptoAesCcmFinalize(&mContext, aTag, mTagLength)); }
+
+Error AesCcm::Verify(const void *aExpectedTag) { return otPlatCryptoAesCcmVerify(&mContext, aExpectedTag, mTagLength); }
+
+#else // OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+
+void AesCcm::SetKey(const Key &aKey) { mEcb.SetKey(aKey); }
 
 void AesCcm::SetKey(const uint8_t *aKey, uint16_t aKeyLength)
 {
@@ -60,7 +127,8 @@ void AesCcm::Init(uint32_t    aHeaderLength,
                   uint32_t    aPlainTextLength,
                   uint8_t     aTagLength,
                   const void *aNonce,
-                  uint8_t     aNonceLength)
+                  uint8_t     aNonceLength,
+                  Mode        aMode)
 {
     const uint8_t *nonceBytes  = reinterpret_cast<const uint8_t *>(aNonce);
     uint8_t        blockLength = 0;
@@ -68,7 +136,8 @@ void AesCcm::Init(uint32_t    aHeaderLength,
     uint8_t        L;
     uint8_t        i;
 
-    // Tag length must be even and within [kMinTagLength, kMaxTagLength]
+    OT_UNUSED_VARIABLE(aMode);
+
     OT_ASSERT(((aTagLength & 0x1) == 0) && (kMinTagLength <= aTagLength) && (aTagLength <= kMaxTagLength));
 
     L = 0;
@@ -194,6 +263,7 @@ void AesCcm::Payload(void *aPlainText, void *aCipherText, uint32_t aLength, Mode
     uint8_t *ciphertextBytes = reinterpret_cast<uint8_t *>(aCipherText);
     uint8_t  byte;
 
+    OT_ASSERT(plaintextBytes != nullptr && ciphertextBytes != nullptr);
     OT_ASSERT(mPlainTextCur + aLength <= mPlainTextLength);
 
     for (unsigned i = 0; i < aLength; i++)
@@ -214,21 +284,13 @@ void AesCcm::Payload(void *aPlainText, void *aCipherText, uint32_t aLength, Mode
 
         if (aMode == kEncrypt)
         {
-            byte = plaintextBytes[i];
-
-            if (ciphertextBytes != nullptr)
-            {
-                ciphertextBytes[i] = byte ^ mCtrPad[mCtrLength++];
-            }
+            byte               = plaintextBytes[i];
+            ciphertextBytes[i] = byte ^ mCtrPad[mCtrLength++];
         }
         else
         {
-            byte = ciphertextBytes[i] ^ mCtrPad[mCtrLength++];
-
-            if (plaintextBytes != nullptr)
-            {
-                plaintextBytes[i] = byte;
-            }
+            byte              = ciphertextBytes[i] ^ mCtrPad[mCtrLength++];
+            plaintextBytes[i] = byte;
         }
 
         if (mBlockLength == sizeof(mBlock))
@@ -282,6 +344,17 @@ void AesCcm::Finalize(void *aTag)
         tagBytes[i] = mBlock[i] ^ mCtrPad[i];
     }
 }
+
+Error AesCcm::Verify(const void *aExpectedTag)
+{
+    uint8_t computedTag[kMaxTagLength];
+
+    Finalize(computedTag);
+
+    return (memcmp(computedTag, aExpectedTag, mTagLength) == 0) ? kErrorNone : kErrorSecurity;
+}
+
+#endif // OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
 
 void AesCcm::GenerateNonce(const Mac::ExtAddress &aAddress,
                            uint32_t               aFrameCounter,

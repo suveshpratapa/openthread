@@ -1388,10 +1388,10 @@ void TxFrame::ProcessTransmitAesCcm(const ExtAddress &aExtAddress)
 
     Crypto::AesCcm::GenerateNonce(aExtAddress, frameCounter, securityLevel, nonce);
 
-    aesCcm.SetKey(GetAesKey());
-    tagLength = GetFooterLength() - GetFcsSize();
+    tagLength = static_cast<uint8_t>(GetFooterLength() - GetFcsSize());
 
-    aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce));
+    aesCcm.SetKey(GetAesKey());
+    aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce), Crypto::AesCcm::kEncrypt);
     aesCcm.Header(GetHeader(), GetHeaderLength());
     aesCcm.Payload(GetPayload(), GetPayload(), GetPayloadLength(), Crypto::AesCcm::kEncrypt);
     aesCcm.Finalize(GetFooter());
@@ -1424,11 +1424,12 @@ void TxFrame::DecryptTransmitAesCcm(const ExtAddress &aExtAddress)
     aesCcm.SetKey(GetAesKey());
     tagLength = GetFooterLength() - GetFcsSize();
 
-    aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce));
+    aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce), Crypto::AesCcm::kDecrypt);
     aesCcm.Header(GetHeader(), GetHeaderLength());
     aesCcm.Payload(GetPayload(), GetPayload(), GetPayloadLength(), Crypto::AesCcm::kDecrypt);
-    // Note: We skip aesCcm.Finalize() checking because we are only decrypting back to plaintext,
-    // and we know the ciphertext was generated correctly by us previously.
+    // Note: We intentionally skip the tag verification here because we are only decrypting back to plaintext, and we
+    // know the ciphertext was generated correctly by us previously. The AesCcm destructor releases any platform state
+    // even if the operation is not finalized.
 
     SetIsSecurityProcessed(false);
     SetIsHeaderUpdated(false);
@@ -1624,11 +1625,11 @@ exit:
 Error RxFrame::ProcessReceiveAesCcm(const ExtAddress &aExtAddress, const KeyMaterial &aMacKey)
 {
 #if OPENTHREAD_FTD || OPENTHREAD_MTD
+
     Error          error        = kErrorSecurity;
     uint32_t       frameCounter = 0;
     uint8_t        securityLevel;
     uint8_t        nonce[Crypto::AesCcm::kNonceSize];
-    uint8_t        tag[kMaxMicSize];
     uint8_t        tagLength;
     Crypto::AesCcm aesCcm;
 
@@ -1639,21 +1640,21 @@ Error RxFrame::ProcessReceiveAesCcm(const ExtAddress &aExtAddress, const KeyMate
 
     Crypto::AesCcm::GenerateNonce(aExtAddress, frameCounter, securityLevel, nonce);
 
-    aesCcm.SetKey(aMacKey);
-    tagLength = GetFooterLength() - GetFcsSize();
+    tagLength = static_cast<uint8_t>(GetFooterLength() - GetFcsSize());
 
-    aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce));
+    aesCcm.SetKey(aMacKey);
+    aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce), Crypto::AesCcm::kDecrypt);
     aesCcm.Header(GetHeader(), GetHeaderLength());
 #ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
     aesCcm.Payload(GetPayload(), GetPayload(), GetPayloadLength(), Crypto::AesCcm::kDecrypt);
+    SuccessOrExit(error = aesCcm.Verify(GetFooter()));
 #else
-    // For fuzz tests, execute AES but do not alter the payload. A large
-    aesCcm.Payload(nullptr, GetPayload(), GetPayloadLength(), Crypto::AesCcm::kDecrypt);
-#endif
-    aesCcm.Finalize(tag);
-
-#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
-    VerifyOrExit(memcmp(tag, GetFooter(), tagLength) == 0);
+    {
+        // Decrypt into a scratch buffer (rather than in place) so the fuzz input payload is preserved
+        // across both the software and platform `AesCcm` backends.
+        uint8_t scratch[OT_RADIO_FRAME_MAX_SIZE];
+        aesCcm.Payload(scratch, GetPayload(), GetPayloadLength(), Crypto::AesCcm::kDecrypt);
+    }
 #endif
 
     error = kErrorNone;

@@ -68,6 +68,21 @@
 #define OPENTHREAD_CONFIG_CRYPTO_PLATFORM_ALLOCS_CONTEXT 0
 #endif
 
+/**
+ * @def OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+ *
+ * Define to 1 to delegate AES-CCM* AEAD operations to the platform.
+ *
+ * When enabled, `Crypto::AesCcm` dispatches `Init` / `Header` / `Payload` / `Finalize` / `Verify` to the multipart
+ * AES-CCM* platform APIs (`otPlatCryptoAesCcmInit`, `otPlatCryptoAesCcmStart`, `otPlatCryptoAesCcmHeaderUpdate`,
+ * `otPlatCryptoAesCcmPayloadUpdate`, `otPlatCryptoAesCcmFinalize`, `otPlatCryptoAesCcmVerify`,
+ * `otPlatCryptoAesCcmDeinit`), letting the platform supply the AES-CCM* implementation. When disabled (default), the
+ * OpenThread core software AES-CCM* engine is used.
+ */
+#ifndef OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+#define OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE 0
+#endif
+
 #if OPENTHREAD_CONFIG_CRYPTO_LIB == OPENTHREAD_CONFIG_CRYPTO_LIB_PLATFORM
 
 /**
@@ -104,6 +119,18 @@
  */
 #ifndef OPENTHREAD_CONFIG_SHA256_CONTEXT_SIZE
 #error "OPENTHREAD_CONFIG_SHA256_CONTEXT_SIZE is missing"
+#endif
+
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+/**
+ * @def OPENTHREAD_CONFIG_AES_CCM_CONTEXT_SIZE
+ *
+ * The size of the AES-CCM* multipart operation context byte array. Only applicable with
+ * OPENTHREAD_CONFIG_CRYPTO_LIB_PLATFORM combined with OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE.
+ */
+#ifndef OPENTHREAD_CONFIG_AES_CCM_CONTEXT_SIZE
+#error "OPENTHREAD_CONFIG_AES_CCM_CONTEXT_SIZE is missing"
+#endif
 #endif
 
 #endif // OPENTHREAD_CONFIG_CRYPTO_LIB == OPENTHREAD_CONFIG_CRYPTO_LIB_PLATFORM
