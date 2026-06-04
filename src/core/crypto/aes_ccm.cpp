@@ -42,7 +42,7 @@
 namespace ot {
 namespace Crypto {
 
-#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && !OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
 
 AesCcm::AesCcm(void) { SuccessOrAssert(otPlatCryptoAesCcmInit(&mContext)); }
 
@@ -103,7 +103,7 @@ void AesCcm::Finalize(void *aTag) { SuccessOrAssert(otPlatCryptoAesCcmFinalize(&
 
 Error AesCcm::Verify(const void *aExpectedTag) { return otPlatCryptoAesCcmVerify(&mContext, aExpectedTag, mTagLength); }
 
-#else // OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+#else // OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && !OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
 
 void AesCcm::SetKey(const Key &aKey) { mEcb.SetKey(aKey); }
 
@@ -354,7 +354,44 @@ Error AesCcm::Verify(const void *aExpectedTag)
     return (memcmp(computedTag, aExpectedTag, mTagLength) == 0) ? kErrorNone : kErrorSecurity;
 }
 
-#endif // OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+#endif // OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && !OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
+
+Error AesCcm::EncryptAndTag(const uint8_t *aNonce,
+                            const void    *aHeader,
+                            uint16_t       aHeaderLength,
+                            void          *aPayload,
+                            uint16_t       aPayloadLength,
+                            void          *aTag,
+                            uint8_t        aTagLength)
+{
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
+    return mEcb.EncryptAndTag(aNonce, aHeader, aHeaderLength, aPayload, aPayloadLength, aTag, aTagLength);
+#else
+    Init(aHeaderLength, aPayloadLength, aTagLength, aNonce, kNonceSize, kEncrypt);
+    Header(aHeader, aHeaderLength);
+    Payload(aPayload, aPayload, aPayloadLength, kEncrypt);
+    Finalize(aTag);
+    return kErrorNone;
+#endif
+}
+
+Error AesCcm::DecryptAndVerify(const uint8_t *aNonce,
+                               const void    *aHeader,
+                               uint16_t       aHeaderLength,
+                               void          *aPayload,
+                               uint16_t       aPayloadLength,
+                               const void    *aTag,
+                               uint8_t        aTagLength)
+{
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
+    return mEcb.DecryptAndVerify(aNonce, aHeader, aHeaderLength, aPayload, aPayloadLength, aTag, aTagLength);
+#else
+    Init(aHeaderLength, aPayloadLength, aTagLength, aNonce, kNonceSize, kDecrypt);
+    Header(aHeader, aHeaderLength);
+    Payload(aPayload, aPayload, aPayloadLength, kDecrypt);
+    return Verify(aTag);
+#endif
+}
 
 void AesCcm::GenerateNonce(const Mac::ExtAddress &aAddress,
                            uint32_t               aFrameCounter,

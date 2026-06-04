@@ -79,7 +79,7 @@ public:
         kDecrypt, // Decryption mode.
     };
 
-#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && !OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
     /**
      * Constructor for `AesCcm`.
      */
@@ -204,6 +204,59 @@ public:
     Error Verify(const void *aExpectedTag);
 
     /**
+     * Decrypts and verifies a complete AES-CCM* payload in a single call.
+     *
+     * When `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE` is enabled this dispatches to the single-shot
+     * platform hook (`otPlatCryptoAesDecryptAndVerify`). Otherwise it is implemented as `Init` / `Header` / `Payload`
+     * / `Verify` using whatever backend is active (multipart platform or software).
+     *
+     * @param[in]      aNonce          Nonce (13 bytes, IEEE 802.15.4 CCM* format).
+     * @param[in]      aHeader         Additional authenticated data.
+     * @param[in]      aHeaderLength   Length of @p aHeader in bytes.
+     * @param[in,out]  aPayload        Ciphertext on input; replaced with plaintext in place on success.
+     * @param[in]      aPayloadLength  Length of @p aPayload in bytes.
+     * @param[in]      aTag            MIC buffer of length @p aTagLength bytes.
+     * @param[in]      aTagLength      MIC length in bytes (4, 8, or 16).
+     *
+     * @retval kErrorNone      Successfully decrypted and verified @p aPayload.
+     * @retval kErrorSecurity  MIC verification failed.
+     * @retval kErrorFailed    Platform operation failed.
+     */
+    Error DecryptAndVerify(const uint8_t *aNonce,
+                           const void    *aHeader,
+                           uint16_t       aHeaderLength,
+                           void          *aPayload,
+                           uint16_t       aPayloadLength,
+                           const void    *aTag,
+                           uint8_t        aTagLength);
+
+    /**
+     * Encrypts and tags a complete AES-CCM* payload in a single call.
+     *
+     * When `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE` is enabled this dispatches to the single-shot
+     * platform hook (`otPlatCryptoAesEncryptAndTag`). Otherwise it is implemented as `Init` / `Header` / `Payload`
+     * / `Finalize` using whatever backend is active (multipart platform or software).
+     *
+     * @param[in]      aNonce          Nonce (13 bytes, IEEE 802.15.4 CCM* format).
+     * @param[in]      aHeader         Additional authenticated data.
+     * @param[in]      aHeaderLength   Length of @p aHeader in bytes.
+     * @param[in,out]  aPayload        Plaintext on input; replaced with ciphertext in place on success.
+     * @param[in]      aPayloadLength  Length of @p aPayload in bytes.
+     * @param[out]     aTag            Buffer to receive the MIC; must be at least @p aTagLength bytes.
+     * @param[in]      aTagLength      MIC length in bytes (4, 8, or 16).
+     *
+     * @retval kErrorNone    Successfully encrypted @p aPayload and generated MIC in @p aTag.
+     * @retval kErrorFailed  Platform operation failed.
+     */
+    Error EncryptAndTag(const uint8_t *aNonce,
+                        const void    *aHeader,
+                        uint16_t       aHeaderLength,
+                        void          *aPayload,
+                        uint16_t       aPayloadLength,
+                        void          *aTag,
+                        uint8_t        aTagLength);
+
+    /**
      * Generates IEEE 802.15.4 nonce byte sequence.
      *
      * @param[in]  aAddress        An extended address.
@@ -217,7 +270,7 @@ public:
                               uint8_t               *aNonce);
 
 private:
-#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && !OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
     ContextWith<kAesCcmContextSize> mContext;
     Key                             mKey;
 #else

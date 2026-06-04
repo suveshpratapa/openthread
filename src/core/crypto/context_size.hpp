@@ -35,7 +35,7 @@
 
 #if OPENTHREAD_CONFIG_CRYPTO_LIB == OPENTHREAD_CONFIG_CRYPTO_LIB_MBEDTLS
 #include <mbedtls/aes.h>
-#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && !OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
 #include <mbedtls/ccm.h>
 #endif
 #include <mbedtls/md.h>
@@ -53,7 +53,7 @@ constexpr uint16_t kAesContextSize        = sizeof(mbedtls_aes_context);
 constexpr uint16_t kHmacSha256ContextSize = sizeof(mbedtls_md_context_t);
 constexpr uint16_t kHkdfContextSize       = sizeof(otCryptoSha256Hash);
 constexpr uint16_t kSha256ContextSize     = sizeof(mbedtls_sha256_context);
-#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && !OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
 constexpr uint16_t kAesCcmContextSize = sizeof(mbedtls_ccm_context);
 #endif
 
@@ -63,7 +63,7 @@ constexpr uint16_t kAesContextSize        = sizeof(psa_key_id_t);
 constexpr uint16_t kHmacSha256ContextSize = sizeof(psa_mac_operation_t);
 constexpr uint16_t kHkdfContextSize       = sizeof(psa_key_derivation_operation_t);
 constexpr uint16_t kSha256ContextSize     = sizeof(psa_hash_operation_t);
-#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && !OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
 constexpr uint16_t kAesCcmContextSize = sizeof(psa_aead_operation_t);
 #endif
 
@@ -73,7 +73,7 @@ constexpr uint16_t kAesContextSize        = OPENTHREAD_CONFIG_AES_CONTEXT_SIZE;
 constexpr uint16_t kHmacSha256ContextSize = OPENTHREAD_CONFIG_HMAC_SHA256_CONTEXT_SIZE;
 constexpr uint16_t kHkdfContextSize       = OPENTHREAD_CONFIG_HKDF_CONTEXT_SIZE;
 constexpr uint16_t kSha256ContextSize     = OPENTHREAD_CONFIG_SHA256_CONTEXT_SIZE;
-#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && !OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
 constexpr uint16_t kAesCcmContextSize = OPENTHREAD_CONFIG_AES_CCM_CONTEXT_SIZE;
 #endif
 

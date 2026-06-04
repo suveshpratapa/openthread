@@ -73,14 +73,34 @@
  *
  * Define to 1 to delegate AES-CCM* AEAD operations to the platform.
  *
- * When enabled, `Crypto::AesCcm` dispatches `Init` / `Header` / `Payload` / `Finalize` / `Verify` to the multipart
- * AES-CCM* platform APIs (`otPlatCryptoAesCcmInit`, `otPlatCryptoAesCcmStart`, `otPlatCryptoAesCcmHeaderUpdate`,
+ * When enabled without `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE`, `Crypto::AesCcm` dispatches
+ * `Init` / `Header` / `Payload` / `Finalize` / `Verify` to the multipart AES-CCM* platform APIs
+ * (`otPlatCryptoAesCcmInit`, `otPlatCryptoAesCcmStart`, `otPlatCryptoAesCcmHeaderUpdate`,
  * `otPlatCryptoAesCcmPayloadUpdate`, `otPlatCryptoAesCcmFinalize`, `otPlatCryptoAesCcmVerify`,
- * `otPlatCryptoAesCcmDeinit`), letting the platform supply the AES-CCM* implementation. When disabled (default), the
- * OpenThread core software AES-CCM* engine is used.
+ * `otPlatCryptoAesCcmDeinit`). When also combined with `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE`,
+ * `Crypto::AesCcm::EncryptAndTag` / `DecryptAndVerify` dispatch to the single-shot platform APIs
+ * (`otPlatCryptoAesEncryptAndTag`, `otPlatCryptoAesDecryptAndVerify`) while `Init`/`Header`/`Payload`/`Finalize`/
+ * `Verify` use the software AES-CCM* engine (used by MLE). When disabled (default), the OpenThread core software
+ * AES-CCM* engine is used for all operations.
  */
 #ifndef OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
 #define OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE 0
+#endif
+
+/**
+ * @def OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
+ *
+ * Define to 1 to enable the single-shot platform AES-CCM* hook for MAC frame security.
+ *
+ * Requires `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE` to also be set to 1. When both are enabled,
+ * `Crypto::AesCcm::EncryptAndTag` and `DecryptAndVerify` call `otPlatCryptoAesEncryptAndTag` and
+ * `otPlatCryptoAesDecryptAndVerify` respectively, allowing a platform to process an entire MAC frame in a single
+ * hardware accelerator transaction. The granular `Init`/`Header`/`Payload`/`Finalize`/`Verify` path continues to
+ * use the software engine (MLE is unaffected). When disabled (default), multipart platform dispatch is used for all
+ * `AesCcm` operations when `OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE` is set.
+ */
+#ifndef OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
+#define OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE 0
 #endif
 
 #if OPENTHREAD_CONFIG_CRYPTO_LIB == OPENTHREAD_CONFIG_CRYPTO_LIB_PLATFORM
@@ -121,12 +141,13 @@
 #error "OPENTHREAD_CONFIG_SHA256_CONTEXT_SIZE is missing"
 #endif
 
-#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && !OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
 /**
  * @def OPENTHREAD_CONFIG_AES_CCM_CONTEXT_SIZE
  *
  * The size of the AES-CCM* multipart operation context byte array. Only applicable with
- * OPENTHREAD_CONFIG_CRYPTO_LIB_PLATFORM combined with OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE.
+ * OPENTHREAD_CONFIG_CRYPTO_LIB_PLATFORM combined with OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE (multipart mode).
+ * Not required when OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE is also set.
  */
 #ifndef OPENTHREAD_CONFIG_AES_CCM_CONTEXT_SIZE
 #error "OPENTHREAD_CONFIG_AES_CCM_CONTEXT_SIZE is missing"

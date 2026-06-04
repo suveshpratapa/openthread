@@ -1391,10 +1391,8 @@ void TxFrame::ProcessTransmitAesCcm(const ExtAddress &aExtAddress)
     tagLength = static_cast<uint8_t>(GetFooterLength() - GetFcsSize());
 
     aesCcm.SetKey(GetAesKey());
-    aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce), Crypto::AesCcm::kEncrypt);
-    aesCcm.Header(GetHeader(), GetHeaderLength());
-    aesCcm.Payload(GetPayload(), GetPayload(), GetPayloadLength(), Crypto::AesCcm::kEncrypt);
-    aesCcm.Finalize(GetFooter());
+    SuccessOrExit(aesCcm.EncryptAndTag(nonce, GetHeader(), GetHeaderLength(), GetPayload(), GetPayloadLength(),
+                                       GetFooter(), tagLength));
 
     SetIsSecurityProcessed(true);
 
@@ -1643,16 +1641,17 @@ Error RxFrame::ProcessReceiveAesCcm(const ExtAddress &aExtAddress, const KeyMate
     tagLength = static_cast<uint8_t>(GetFooterLength() - GetFcsSize());
 
     aesCcm.SetKey(aMacKey);
-    aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce), Crypto::AesCcm::kDecrypt);
-    aesCcm.Header(GetHeader(), GetHeaderLength());
 #ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
-    aesCcm.Payload(GetPayload(), GetPayload(), GetPayloadLength(), Crypto::AesCcm::kDecrypt);
-    SuccessOrExit(error = aesCcm.Verify(GetFooter()));
+    SuccessOrExit(error = aesCcm.DecryptAndVerify(nonce, GetHeader(), GetHeaderLength(), GetPayload(),
+                                                   GetPayloadLength(), GetFooter(), tagLength));
 #else
     {
-        // Decrypt into a scratch buffer (rather than in place) so the fuzz input payload is preserved
-        // across both the software and platform `AesCcm` backends.
+        // Fuzz mode: run AES operations without altering the payload or verifying the tag (prevents timeout on large
+        // frames). Granular Init/Header/Payload avoids the single-shot path and keeps the payload untouched.
         uint8_t scratch[OT_RADIO_FRAME_MAX_SIZE];
+        aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce),
+                    Crypto::AesCcm::kDecrypt);
+        aesCcm.Header(GetHeader(), GetHeaderLength());
         aesCcm.Payload(scratch, GetPayload(), GetPayloadLength(), Crypto::AesCcm::kDecrypt);
     }
 #endif

@@ -302,6 +302,55 @@ exit:
 
 #endif // OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE
 
+#if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
+
+// The mbedTLS AES-ECB context stores an expanded key schedule, not the raw key bytes.
+// `mbedtls_ccm_setkey()` requires raw key bytes, so a software CCM fallback is not possible here.
+// Platforms using OPENTHREAD_CONFIG_CRYPTO_LIB_MBEDTLS with SINGLE_SHOT_ENABLE must provide strong
+// overrides for these symbols (e.g. via a hardware accelerator). The PSA library provides a full
+// software reference implementation via `crypto_platform_psa.cpp`.
+OT_TOOL_WEAK otError otPlatCryptoAesDecryptAndVerify(otCryptoContext *aContext,
+                                                     const uint8_t   *aNonce,
+                                                     const void      *aHeader,
+                                                     uint16_t         aHeaderLength,
+                                                     void            *aPayload,
+                                                     uint16_t         aPayloadLength,
+                                                     const void      *aTag,
+                                                     uint8_t          aTagLength)
+{
+    OT_UNUSED_VARIABLE(aContext);
+    OT_UNUSED_VARIABLE(aNonce);
+    OT_UNUSED_VARIABLE(aHeader);
+    OT_UNUSED_VARIABLE(aHeaderLength);
+    OT_UNUSED_VARIABLE(aPayload);
+    OT_UNUSED_VARIABLE(aPayloadLength);
+    OT_UNUSED_VARIABLE(aTag);
+    OT_UNUSED_VARIABLE(aTagLength);
+    return kErrorFailed;
+}
+
+OT_TOOL_WEAK otError otPlatCryptoAesEncryptAndTag(otCryptoContext *aContext,
+                                                  const uint8_t   *aNonce,
+                                                  const void      *aHeader,
+                                                  uint16_t         aHeaderLength,
+                                                  void            *aPayload,
+                                                  uint16_t         aPayloadLength,
+                                                  void            *aTag,
+                                                  uint8_t          aTagLength)
+{
+    OT_UNUSED_VARIABLE(aContext);
+    OT_UNUSED_VARIABLE(aNonce);
+    OT_UNUSED_VARIABLE(aHeader);
+    OT_UNUSED_VARIABLE(aHeaderLength);
+    OT_UNUSED_VARIABLE(aPayload);
+    OT_UNUSED_VARIABLE(aPayloadLength);
+    OT_UNUSED_VARIABLE(aTag);
+    OT_UNUSED_VARIABLE(aTagLength);
+    return kErrorFailed;
+}
+
+#endif // OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
+
 #if OPENTHREAD_FTD || OPENTHREAD_MTD
 
 // HMAC implementations
