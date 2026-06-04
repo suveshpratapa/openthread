@@ -1643,14 +1643,13 @@ Error RxFrame::ProcessReceiveAesCcm(const ExtAddress &aExtAddress, const KeyMate
     aesCcm.SetKey(aMacKey);
 #ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
     SuccessOrExit(error = aesCcm.DecryptAndVerify(nonce, GetHeader(), GetHeaderLength(), GetPayload(),
-                                                   GetPayloadLength(), GetFooter(), tagLength));
+                                                  GetPayloadLength(), GetFooter(), tagLength));
 #else
     {
         // Fuzz mode: run AES operations without altering the payload or verifying the tag (prevents timeout on large
         // frames). Granular Init/Header/Payload avoids the single-shot path and keeps the payload untouched.
         uint8_t scratch[OT_RADIO_FRAME_MAX_SIZE];
-        aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce),
-                    Crypto::AesCcm::kDecrypt);
+        aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce), Crypto::AesCcm::kDecrypt);
         aesCcm.Header(GetHeader(), GetHeaderLength());
         aesCcm.Payload(scratch, GetPayload(), GetPayloadLength(), Crypto::AesCcm::kDecrypt);
     }

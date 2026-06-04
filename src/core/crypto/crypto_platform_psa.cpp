@@ -585,10 +585,10 @@ OT_TOOL_WEAK otError otPlatCryptoAesDecryptAndVerify(otCryptoContext *aContext,
     memcpy(ciphertextWithTag + aPayloadLength, aTag, aTagLength);
 
     keyRef = static_cast<psa_key_id_t *>(aContext->mContext);
-    status = psa_aead_decrypt(*keyRef, PSA_ALG_AEAD_WITH_SHORTENED_TAG(PSA_ALG_CCM, aTagLength), aNonce,
-                              AesCcm::kNonceSize, static_cast<const uint8_t *>(aHeader), aHeaderLength,
-                              ciphertextWithTag, aPayloadLength + aTagLength, static_cast<uint8_t *>(aPayload),
-                              aPayloadLength, &plaintextLen);
+    status =
+        psa_aead_decrypt(*keyRef, PSA_ALG_AEAD_WITH_SHORTENED_TAG(PSA_ALG_CCM, aTagLength), aNonce, AesCcm::kNonceSize,
+                         static_cast<const uint8_t *>(aHeader), aHeaderLength, ciphertextWithTag,
+                         aPayloadLength + aTagLength, static_cast<uint8_t *>(aPayload), aPayloadLength, &plaintextLen);
 
     error = (status == PSA_ERROR_INVALID_SIGNATURE) ? kErrorSecurity : PsaToOtError(status);
 
@@ -616,10 +616,10 @@ OT_TOOL_WEAK otError otPlatCryptoAesEncryptAndTag(otCryptoContext *aContext,
     VerifyOrExit(aPayloadLength + aTagLength <= sizeof(ciphertextWithTag), error = kErrorInvalidArgs);
 
     keyRef = static_cast<psa_key_id_t *>(aContext->mContext);
-    status = psa_aead_encrypt(*keyRef, PSA_ALG_AEAD_WITH_SHORTENED_TAG(PSA_ALG_CCM, aTagLength), aNonce,
-                              AesCcm::kNonceSize, static_cast<const uint8_t *>(aHeader), aHeaderLength,
-                              static_cast<const uint8_t *>(aPayload), aPayloadLength, ciphertextWithTag,
-                              sizeof(ciphertextWithTag), &ciphertextLen);
+    status =
+        psa_aead_encrypt(*keyRef, PSA_ALG_AEAD_WITH_SHORTENED_TAG(PSA_ALG_CCM, aTagLength), aNonce, AesCcm::kNonceSize,
+                         static_cast<const uint8_t *>(aHeader), aHeaderLength, static_cast<const uint8_t *>(aPayload),
+                         aPayloadLength, ciphertextWithTag, sizeof(ciphertextWithTag), &ciphertextLen);
     SuccessOrExit(error = PsaToOtError(status));
     VerifyOrExit(ciphertextLen == aPayloadLength + aTagLength, error = kErrorFailed);
 
