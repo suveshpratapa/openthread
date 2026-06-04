@@ -48,18 +48,6 @@ void AesEcb::Encrypt(const uint8_t aInput[kBlockSize], uint8_t aOutput[kBlockSiz
 }
 
 #if OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
-Error AesEcb::DecryptAndVerify(const uint8_t *aNonce,
-                               const void    *aHeader,
-                               uint16_t       aHeaderLength,
-                               void          *aPayload,
-                               uint16_t       aPayloadLength,
-                               const void    *aTag,
-                               uint8_t        aTagLength)
-{
-    return otPlatCryptoAesDecryptAndVerify(&mContext, aNonce, aHeader, aHeaderLength, aPayload, aPayloadLength, aTag,
-                                           aTagLength);
-}
-
 Error AesEcb::EncryptAndTag(const uint8_t *aNonce,
                             const void    *aHeader,
                             uint16_t       aHeaderLength,
@@ -70,6 +58,18 @@ Error AesEcb::EncryptAndTag(const uint8_t *aNonce,
 {
     return otPlatCryptoAesEncryptAndTag(&mContext, aNonce, aHeader, aHeaderLength, aPayload, aPayloadLength, aTag,
                                         aTagLength);
+}
+
+Error AesEcb::DecryptAndVerify(const uint8_t *aNonce,
+                               const void    *aHeader,
+                               uint16_t       aHeaderLength,
+                               void          *aPayload,
+                               uint16_t       aPayloadLength,
+                               const void    *aTag,
+                               uint8_t        aTagLength)
+{
+    return otPlatCryptoAesDecryptAndVerify(&mContext, aNonce, aHeader, aHeaderLength, aPayload, aPayloadLength, aTag,
+                                           aTagLength);
 }
 #endif // OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_ENABLE && OPENTHREAD_CONFIG_CRYPTO_PLATFORM_CCM_SINGLE_SHOT_ENABLE
 
