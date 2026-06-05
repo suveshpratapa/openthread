@@ -1,968 +1,1275 @@
-# Thread Constrained Peer Link — Implementation Design
+# Thread Direct — Implementation Design
 
-**Baseline commit:** `0d4a43ab8` (from upstream)
-
-**Spec reference:** Thread 2.0 spec section 16 — Constrained Peer Link
-
-**Author:** Suvesh Pratapa
-
-**Status:** Working Draft — seeking reviewer feedback
+**Baseline commit:** `fb274efe6` (upstream OpenThread `main`)  
+**Spec reference:** Thread 2.0 Chapter 16 — Thread Direct  
+**Status:** Implementation in progress — PR 0 (cleanup) and PR 1 (secure wake initiator/listener + guest key support) complete; PR 2+ sections track remaining work.
 
 ---
 
-## 1. Scope
+## Table of Contents
 
-This document describes the implementation plan for the Thread Constrained Peer Link (CPL) feature, covering the OpenThread stack, platform abstraction layer (PAL), and Spinel commands for co-processor (RCP/NCP) architectures.
+1. [Overview](#1-overview)
+2. [Terminology and Spec Quick-Reference](#2-terminology-and-spec-quick-reference)
+3. [Config and Feature Flags](#3-config-and-feature-flags)
+4. [Wire Format](#4-wire-format)
+5. [Key Derivation](#5-key-derivation)
+6. [Stack Changes: MAC Layer](#6-stack-changes-mac-layer)
+7. [Stack Changes: Thread Direct Handler](#7-stack-changes-thread-direct-handler)
+8. [Stack Changes: Post-Link Data Transfer](#8-stack-changes-post-link-data-transfer)
+9. [Public API](#9-public-api)
+10. [Platform Abstraction Layer](#10-platform-abstraction-layer)
+11. [Spinel / Co-Processor Support](#11-spinel--co-processor-support)
+12. [CLI Extensions](#12-cli-extensions)
+13. [Open Spec Items (TBD / Unclear)](#13-open-spec-items-tbd--unclear)
+14. [Pull-Request Plan](#14-pull-request-plan)
 
-### 1.1  Existing Components and Configuration
+---
 
-The upstream codebase at `0d4a43ab8` provides the scaffolding below. Several config names pre-date Chapter 16 CPL terminology; this design retains them with their current names for ABI stability, adding new names only for novel CPL semantics (see Decision A in §1.2).
+## 1. Overview
 
-| Component | Reuse Status | CPL / Chapter 16 Mapping |
+Thread Direct (TD) is a MAC-layer peer-to-peer link between two Thread devices that belong to the same Thread network. It allows a **Wake Initiator (WI)** to reach a deeply-sleeping **Wake Listener (WL)** without MLE-level interaction, using a compact three-frame exchange:
+
+```
+WI  ──[Wake Frame (0x54 / 0x01)]──►  WL   (broadcast or unicast, repeated at 7.5 ms)
+WL  ──[TD Link Command (0x54 / 0x02)]──►  WI   (with SCA LTV + Challenge LTV)
+WI  ──[Enh-ACK + Thread Header IE (0x2d)]──►  WL  (Challenge LTV echoed)
+```
+
+After this handshake, the two peers have exchanged SLW (Scheduled Listen Window) parameters and both can schedule data transmissions into each other's receive windows.
+
+Key constraints that shape the design:
+- The Enh-ACK must be generated within the IEEE 802.15.4 hardware ACK turnaround window (~192 µs on EFR32). The Challenge LTV bytes carried in it are not computed from scratch in that window; instead the WI **echoes** the received challenge bytes verbatim.
+- WL listen scheduling (periodic ReceiveAt on Wake Channel 20) is already implemented in `sub_mac_wed.cpp`.
+- Post-link frame scheduling is modelled directly on the existing `CslTxScheduler` pattern.
+
+**Initial implementation scope:** Thread sleepy-to-sleepy device support, one-to-one wake, unicast-by-ExtAddress, no CoEx constraints (RAM Duration = 1). The wire format definitions and struct codecs in PR 1 are designed from the start to support the full eventual scope (group wake, WakeupId addressing, full CoEx / RAM bitmap, Advertisement Command), so later PRs can extend behavior without touching wire format infrastructure.
+
+---
+
+## 2. Terminology and Spec Quick-Reference
+
+| Term | Meaning |
+|------|---------|
+| WI | Wake Initiator — the device that sends Wake Frames |
+| WL | Wake Listener — the device listening on Wake Channel 20 |
+| TD Link | The established peer-to-peer MAC link |
+| SLW | Scheduled Listen Window — the periodic RX window each peer advertises |
+| SCA LTV | Scheduled Channel Access LTV (Type=0x02 inside Thread Header IE) — carries SLW period, phase, and CoEx constraints |
+| RAM | Radio Availability Mask — CoEx constraint bitmap encoded inside SCA LTV |
+| Wake Channel | Channel 20 (spec §16.4.1) — dedicated channel for all Thread Direct signalling |
+| Wake Interval | 7500 µs (spec §16.12) |
+| Wake Duration | 1090 ms (spec §16.12) |
+| Listen Interval | 1 000 000 µs (spec §16.12) |
+| Listen Duration | 8000 µs (spec §16.12) |
+| TD short address | Deferred/reserved in current chapter 16 baseline (SPEC-1365 direction); active scope uses extended-address path |
+| Wake Key | HMAC-SHA256(NetworkKey, "Thread-Wake"), Key Index 129 (spec §16.5.9) |
+| Thread Header IE | IEEE 802.15.4 Header IE, Element-ID = 0x2d (spec §16.5.7.2) |
+| LTV | Length-Type-Value packing used inside Thread Header IE |
+
+---
+
+## 3. Config and Feature Flags
+
+### 3.1 Existing flags (reused with new names)
+
+The upstream tree at `fb274efe6` already contains the following flags in `src/core/config/wakeup.h`. These renames are now treated as applied baseline for Thread Direct terminology:
+
+| Former name | Current Thread Direct name | Role |
 |---|---|---|
-| [`OPENTHREAD_CONFIG_WAKEUP_COORDINATOR_ENABLE`](https://github.com/openthread/openthread/tree/main/src/core/config/wakeup.h) | Retain | WI (Wake Initiator) |
-| [`OPENTHREAD_CONFIG_WAKEUP_END_DEVICE_ENABLE`](https://github.com/openthread/openthread/tree/main/src/core/config/wakeup.h) | Retain | WL (Wake Listener) |
-| [`OPENTHREAD_CONFIG_WED_LISTEN_INTERVAL`](https://github.com/openthread/openthread/tree/main/src/core/config/wakeup.h) | Retain | `LISTEN_INTERVAL` (spec default: 1000 ms) |
-| [`OPENTHREAD_CONFIG_WED_LISTEN_DURATION`](https://github.com/openthread/openthread/tree/main/src/core/config/wakeup.h) | Retain | `LISTEN_DURATION` (spec default: 8 ms) |
-| [`OPENTHREAD_CONFIG_WAKEUP_COORDINATOR_CONNECTION_RETRY_INTERVAL`](https://github.com/openthread/openthread/tree/main/src/core/config/wakeup.h) | Retain | Retry Interval field (retry window count) |
-| [`OPENTHREAD_CONFIG_WAKEUP_COORDINATOR_CONNECTION_RETRY_COUNT`](https://github.com/openthread/openthread/tree/main/src/core/config/wakeup.h) | Retain | Retry Count field |
-| [`OPENTHREAD_CONFIG_P2P_ENABLE`](https://github.com/openthread/openthread/tree/main/src/core/config/p2p.h) | Retain | CPL feature enable |
-| [`OPENTHREAD_CONFIG_P2P_MAX_PEERS`](https://github.com/openthread/openthread/tree/main/src/core/config/p2p.h) | Retain | CP peer table size |
-| [`WakeupTxScheduler`](https://github.com/openthread/openthread/tree/main/src/core/mac/wakeup_tx_scheduler.hpp) | Reuse and extend | — |
-| [`WakeupRequest`](https://github.com/openthread/openthread/tree/main/include/openthread/provisional/link.h) type | Reuse | — |
-| [`WakeupId`](https://github.com/openthread/openthread/tree/main/include/openthread/provisional/link.h) (`uint64_t`) | Reuse | — |
-| [`ConnectionIe` + `RendezvousTimeIe`](https://github.com/openthread/openthread/tree/main/src/core/mac/mac_header_ie.hpp) | Reuse wire format, can rename and extend | — |
-| [`sub_mac_wed.cpp`](https://github.com/openthread/openthread/tree/main/src/core/mac/sub_mac_wed.cpp) — dual-path WED listen | Largely reuse | — |
-| [`mle_p2p.cpp`](https://github.com/openthread/openthread/tree/main/src/core/thread/mle_p2p.cpp) — P2P MLE state machine | No changes required (see §3.6) | — |
-| [`PeerTable` + `Peer : CslNeighbor`](https://github.com/openthread/openthread/tree/main/src/core/thread/peer_table.hpp) | Reuse and extend | — |
-| [`HmacSha256`](https://github.com/openthread/openthread/tree/main/src/core/crypto/hmac_sha256.hpp) | Reuse | — |
-| [`otP2pWakeupAndLink` / `otP2pUnlink` / `otP2pSetEventCallback`](https://github.com/openthread/openthread/tree/main/include/openthread/provisional/p2p.h) | Reuse API | — |
-| [`otPlatRadioReceiveAt`](https://github.com/openthread/openthread/tree/main/include/openthread/platform/radio.h) | Reuse API | — |
-| [`otLinkSetWakeUpListenEnabled`](https://github.com/openthread/openthread/tree/main/include/openthread/link.h) + params | Reuse API | — |
-| [`otLinkGetWakeupChannel` / `otLinkSetWakeupChannel`](https://github.com/openthread/openthread/tree/main/include/openthread/link.h) | Reuse for CPL | — |
+| `OPENTHREAD_CONFIG_WAKEUP_COORDINATOR_ENABLE` | `OPENTHREAD_CONFIG_THREAD_DIRECT_WAKE_INITIATOR_ENABLE` | Enable WI role |
+| `OPENTHREAD_CONFIG_WAKEUP_END_DEVICE_ENABLE` | `OPENTHREAD_CONFIG_THREAD_DIRECT_WAKE_LISTENER_ENABLE` | Enable WL role |
+| `OPENTHREAD_CONFIG_WAKEUP_TX_INTERVAL` | `OPENTHREAD_CONFIG_THREAD_DIRECT_WAKE_INTERVAL_US` | Wake interval (default 7500 µs) |
+| `OPENTHREAD_CONFIG_WAKEUP_MAX_DURATION` | `OPENTHREAD_CONFIG_THREAD_DIRECT_WAKE_DURATION_MS` | Max wake-phase duration (default 1090 ms) |
+| `OPENTHREAD_CONFIG_WED_LISTEN_INTERVAL` | `OPENTHREAD_CONFIG_THREAD_DIRECT_LISTEN_INTERVAL_US` | WL listen interval (default 1 000 000 µs) |
+| `OPENTHREAD_CONFIG_WED_LISTEN_DURATION` | `OPENTHREAD_CONFIG_THREAD_DIRECT_LISTEN_DURATION_US` | WL listen window (default 8000 µs) |
 
-New configuration flags for CPL-specific behavior:
+The P2P-era flags `OPENTHREAD_CONFIG_P2P_ENABLE` and `OPENTHREAD_CONFIG_P2P_MAX_PEERS` are replaced by:
 
-`config/wakeup.h`:
+| New flag | Default | Description |
+|---|---|---|
+| `OPENTHREAD_CONFIG_THREAD_DIRECT_WAKE_INITIATOR_ENABLE` | 0 | Enable WI role; guards `DirectHandler` WI path, `WakeupTxScheduler` |
+| `OPENTHREAD_CONFIG_THREAD_DIRECT_WAKE_LISTENER_ENABLE` | 0 | Enable WL role; guards `sub_mac_wed` listen scheduling, `DirectHandler` WL path |
+| `OPENTHREAD_CONFIG_THREAD_DIRECT_MAX_DIRECT_PEERS` | 1 | Maximum simultaneous TD peers (raise per product topology) |
+
+### 3.2 New flags
 
 ```c
-// Default Wake Channel for CPL per spec section 16.4.1
-#ifndef OPENTHREAD_CONFIG_CPL_DEFAULT_WAKE_CHANNEL
-#define OPENTHREAD_CONFIG_CPL_DEFAULT_WAKE_CHANNEL 11
+// src/core/config/thread_direct.h  (new file, replaces config/wakeup.h + config/p2p.h)
+
+// Wake Channel (spec §16.4.1): Channel 20 is the Thread Direct Wake Channel.
+#ifndef OPENTHREAD_CONFIG_THREAD_DIRECT_DEFAULT_WAKE_CHANNEL
+#define OPENTHREAD_CONFIG_THREAD_DIRECT_DEFAULT_WAKE_CHANNEL 20
 #endif
 
-// SLW_MIN_DURATION: minimum CP-link SLW duration (spec §16.8.3), in units of 160µs slots
-#ifndef OPENTHREAD_CONFIG_CPL_SLW_MIN_DURATION_SLOTS
-#define OPENTHREAD_CONFIG_CPL_SLW_MIN_DURATION_SLOTS 8  // 8 × 160µs ≈ 1.25ms
+// SLW_MIN_DURATION: minimum advertised SLW duration in 160 µs slots (spec §16.8.3).
+// 8 slots × 160 µs = 1.28 ms.
+#ifndef OPENTHREAD_CONFIG_THREAD_DIRECT_SLW_MIN_DURATION_SLOTS
+#define OPENTHREAD_CONFIG_THREAD_DIRECT_SLW_MIN_DURATION_SLOTS 8
+#endif
+
+// Enable multi-protocol CoEx (full RAM bitmap encoding in SCA LTV, spec §16.10.2).
+// Disabled by default; initial implementation scope uses RAM Duration = 1 (no constraints).
+// The wire format structs and serializers ALWAYS support the full RamBits path regardless
+// of this flag; the flag gates only the DirectHandler / DirectTxScheduler CoEx scheduling logic.
+#ifndef OPENTHREAD_CONFIG_THREAD_DIRECT_COEX_ENABLE
+#define OPENTHREAD_CONFIG_THREAD_DIRECT_COEX_ENABLE 0
+#endif
+
+// Guest Wake Key support: allow out-of-band-provisioned raw 16-byte keys at indices 130–192.
+// Enabled by default — not deferred for initial implementation.
+#ifndef OPENTHREAD_CONFIG_THREAD_DIRECT_GUEST_WAKE_KEY_ENABLE
+#define OPENTHREAD_CONFIG_THREAD_DIRECT_GUEST_WAKE_KEY_ENABLE 1
+#endif
+
+// Maximum number of guest wake keys that can be stored simultaneously.
+#ifndef OPENTHREAD_CONFIG_THREAD_DIRECT_MAX_GUEST_WAKE_KEYS
+#define OPENTHREAD_CONFIG_THREAD_DIRECT_MAX_GUEST_WAKE_KEYS 4
 #endif
 ```
-
-Optional: `config/p2p.h`:
-
-```c
-// Group-wake TX/RX configuration support
-#ifndef OPENTHREAD_CONFIG_P2P_GROUP_WAKEUP_ENABLE
-#define OPENTHREAD_CONFIG_P2P_GROUP_WAKEUP_ENABLE 0  // opt-in; disabled by default
-#endif
-```
-
-### 1.2  Open Design Questions for Feedback
-
-**Decision A — Legacy WED flags**
-
-The existing flags `OPENTHREAD_CONFIG_WAKEUP_COORDINATOR_ENABLE` and `OPENTHREAD_CONFIG_WAKEUP_END_DEVICE_ENABLE` in `config/wakeup.h` were introduced before the CPL spec reached its final form. Two options:
-
-1. **Reuse as-is** (this design's choice): The existing flags guard the CPL code paths. No config renaming is needed because the names (`WAKEUP_COORDINATOR` / `WAKEUP_END_DEVICE`) align reasonably with the spec roles (WI / WL). This avoids a downstream flag migration.
-   
-   or
-2. **Introduce new CPL flags** (`OPENTHREAD_CONFIG_CPL_WAKE_INITIATOR_ENABLE`, `OPENTHREAD_CONFIG_CPL_WAKE_LISTENER_ENABLE`) and deprecate the old names: gives a clean naming boundary but requires all existing users to update their build configuration.
-
-**Decision B — Legacy P2P flags**
-
-The upstream tree contains a working MLE-based 3-way handshake in `mle_p2p.cpp` that was written against an earlier spec draft. The final spec mandates a MAC-layer-only handshake (§16.7). Two options:
-
-1. **Retain `mle_p2p.cpp` undisturbed** (this design's choice): The new `CplHandler` class (§3.3, `src/core/mac/cpl_handler.[ch]pp`) implements the spec-compliant MAC handshake. `mle_p2p.cpp` is left untouched and can be either retained as a legacy path behind a compile guard or removed separately. The two paths are fully independent.
-   
-   or
-2. **Remove `mle_p2p.cpp` now**: Reduces code surface but risks disruption for any PoC deployment relying on it.
-
-**Decision C — Legacy Multipurpose wake frame**
-
-The current `WakeupTxScheduler` sends Multipurpose frames (non-spec). The spec mandates MAC Command 0x54. Options:
-
-1. **Compile guard**  (this design's default):(`OPENTHREAD_CONFIG_CPL_USE_LEGACY_WAKEUP_FRAME`): Retains the Multipurpose path for interoperability with pre-spec devices. A runtime boolean flag can then choose which wakeup format to use at runtime, supporting legacy multipurpose frames.
-   
-   or
-2. **Hard cutover**: `IsWakeupFrame()` and `GenerateWakeupFrame()` are updated to the MAC Command 0x54 format unconditionally.
-
-**Decision D — Enh-ACK IE injection on WI** *(open question)*:
-
-The 3-way handshake requires the WI to include the WL's Challenge IE bytes verbatim in its Enh-ACK — the WI *echoes* the received challenge (spec §16.7.3). This creates a hard real-time constraint: the IEEE 802.15.4 Enh-ACK must be generated within the hardware turnaround window after the CP Link Command arrives. SiLabs EFR32 platforms can meet ~192 µs in practice for Enh-ACK turnaround (though in previous interops we had to adjust to higher values with some other devices, I'm not sure we mandate this because the 15.4 spec is unclear about mandating this value for EnhAcks). The Challenge IE bytes to echo in Enh-ACK are not known until the triggering CP Link Command arrives.
-We need to:
-- Complete HMAC-SHA256 verification
-- In an RCP architecture, also account for round trip to the host
-
- That being said, the spec explicitly permits sending the Enh-ACK before verification completes: *"it’s possible the challenge check couldn’t be done in the platform layer, then the Enh-ACK may be generated first"* (§16.7.1).
-
-I'm looking for advice on the implementation options, especially for RCP.
 
 ---
 
-## 2. Wire Format Changes
+## 4. Wire Format
 
-### 2.1  Wakeup Frame Type: Multipurpose → MAC Command 0x54
+> **Scope note:** All struct definitions, constants, and serializers in this section cover the **full eventual feature set** (group wake, WakeupId addressing, full CoEx / RAM bitmap, Advertisement Command). The initial implementation behavior is constrained (one-to-one wake, RAM Duration = 1), but nothing in the wire layer needs to change to expand to the full scope later. `OPENTHREAD_CONFIG_THREAD_DIRECT_COEX_ENABLE` gates only the scheduler-level CoEx logic — not the codec.
 
-The current upstream code uses **Multipurpose frames** with KeyIdMode2 for the wake frame. The final spec mandates **IEEE 802.15.4 MAC Command frames with command ID `0x54`** (Thread MAC Command, pending formal IEEE allocation; we use `0x54` as the provisional value per spec section 16.14).
+### 4.1 IEEE 802.15.4 MAC Command 0x54
 
-#### Thread MAC Command type hierarchy
+All Thread Direct frames share a single IEEE 802.15.4 MAC Command ID **`0x54`** (Thread MAC Command, pending formal IEEE 802.15.4 allocation; `0x54` is the provisional value per spec §16.14 — **see §13 item 1**). The first payload byte after `0x54` is the **Thread MAC Command ID**, which dispatches to one of three frame types:
 
-All CPL frames share a single IEEE 802.15.4 MAC Command ID (`0x54`). The first payload byte after `0x54` is the **Thread MAC Command ID** (§16.5.7.4), which determines the frame's purpose and the layout of the bytes that follow:
+| Thread MAC Cmd ID | Name | Direction |
+|---|---|---|
+| `0x00` | Advertisement Command | WI broadcast |
+| `0x01` | Wake Command | WI → WL |
+| `0x02` | TD Link Command | WL → WI |
 
-- **`0x00` — Advertisement Command** (§16.9.3.1)
-
-  Remaining payload bytes are zero or more Advertisement LTVs:
-
-  | Advert LTV Type | Meaning |
-  |---|---|
-  | `0x01` | Compressed DNS *(detailed format TBD in spec)* |
-
-- **`0x01` — Wake Command** (§16.5.7.5) — *WI → WL*
-
-  The next payload byte is the **Wake Frame Type** (§16.5.2), followed by Rendezvous Time, Retry Interval (RI), Retry Count (RC), and an optional Channel byte:
-
-  | Wake Frame Type | Meaning |
-  |---|---|
-  | `0x00` | CP Link establishment wake |
-  | `0x01` | Power outage recovery |
-  | `0x02` | Connectionless control |
-
-  The frame *optionally* carries a **Thread Header IE** (`0x2d`) to filter by WakeupId:
-
-  | Header IE LTV Type | Meaning | Present? |
-  |---|---|---|
-  | `0x01` | Target ID (WakeupId filter; §16.5.7.5) | Optional — only when WakeupId addressing is used |
-
-- **`0x02` — CP Link Command** (§16.9.1) — *WL → WI*
-
-  Remaining payload bytes: `[Link Parameter Mask] [Supervision Interval] [Services bitmap] [Short Address]`. The frame *always* carries a **Thread Header IE** (`0x2d`); the Enh-ACK reply from the WI carries one too (§16.7.3):
-
-  | Header IE LTV Type | Meaning | Present? |
-  |---|---|---|
-  | `0x02` | SCA IE — SLW period + phase + CoEx RAM (§16.10.3) | Mandatory if CoEx-constrained; optional otherwise |
-  | `0x03` | Thread Challenge IE — HMAC-SHA256 (§16.7.2) | Mandatory in CP Link Command; echoed verbatim in Enh-ACK |
-
-A "CP Link wake" is therefore a frame with Thread MAC Command ID = `0x01` **and** Wake Frame Type = `0x00` — these are two distinct byte positions in the MAC payload. Full struct definitions and serialization detail for the Thread Header IE LTVs are in §2.2.
-
-#### Spec-compliant frame layout (§16.5.7.5)
-
-Per the spec the Wake Command parameters sit in the MAC Command payload after the Thread MAC Command ID byte:
-
-**Wake Frame (spec layout):**
-```
-[ MHR: FCF (AR=0) | Seq | DstPAN | DstAddr | SrcAddr | SrcPAN ]
-[ Aux Security Header ]
-[ Header IEs: Thread Header IE 0x2d:
-    [TargetId LTV (Type=0x01): WakeupId bytes]  — only if WakeupId addressing is used
-]
-[ MAC Command Payload:
-    0x54                  — IEEE 802.15.4 Command ID
-    0x01                  — Thread MAC Command ID = Wake Command
-    Wake Frame Type       — 0x00 / 0x01 / 0x02 (see table above)
-    Rendezvous Time       — in 10-symbol units
-    Retry Interval (RI)
-    Retry Count (RC)
-    [Channel]             — optional, absent = use current channel
-]
-[ MFR: MIC32 | FCS ]
+Constants to add to `mac_frame.hpp`:
+```cpp
+static constexpr uint8_t kMacCmdDirect            = 0x54; // IEEE 802.15.4 MAC Command ID
+static constexpr uint8_t kThreadMacCmdAdvertisement  = 0x00;
+static constexpr uint8_t kThreadMacCmdWake           = 0x01;
+static constexpr uint8_t kThreadMacCmdDirectLink         = 0x02;
 ```
 
-**CP Link Command (spec layout):**
+### 4.2 Wake Command frame (Thread MAC Cmd 0x01)
+
 ```
 [ MHR: FCF | Seq | DstPAN | DstAddr | SrcAddr | SrcPAN ]
-[ Aux Security Header ]
-[ Header IEs: Thread Header IE 0x2d:
-    SCA IE LTV (Type=0x02): RAM header + [RAM Bits] + [SLW Period + SLW Phase]
-    ChallengeIe LTV (Type=0x03): 16 bytes HMAC challenge
+[ Aux Security Header: KeyIdMode=1, KeyIndex=129 ]
+[ Header IEs:
+    Thread Header IE (0x2d):
+        TargetId LTV (Type=0x01, 1–8 bytes) — OPTIONAL; only present when
+        WakeupId addressing is used.  Omitted for unicast-by-ExtAddress wakes.
 ]
-[ MAC Command Payload:
-    0x54                  — IEEE 802.15.4 Command ID
-    0x02                  — Thread MAC Command ID = CP Link Command
-    [Link Parameter Mask] — bitmap of present optional fields
-    [Supervision Interval]
-    [Services bitmap]
-    [Short Address]
-]
-[ MFR: MIC32 | FCS ]
+[ MAC Command Payload — see RFC bit diagram below ]
+[ MFR: MIC-32 | FCS ]
 ```
 
-**Mechanical changes to `mac_frame.*`:**
+**MAC Command Payload (5 bytes):**
 
-1. **`Frame::IsWakeupFrame()`** (currently checks `kTypeMultipurpose`):  
-   Updated to check: `GetType() == kTypeMacCmd` AND command ID byte `== 0x54` AND Thread MAC Command ID `== 0x01` (Wake Command). The Wake Frame Type (0x00/0x01/0x02) is byte 2 of the MAC Command payload (immediately after the Thread MAC Command ID byte); it is read directly from the payload — not from any IE LTV.
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  MAC Cmd 0x54 |Thread Cmd 0x01|   Wake Type   | Rendezvous Tm |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| RI(4b)| RC(4b)|
++-+-+-+-+-+-+-+-+
+```
 
-2. **`TxFrame::GenerateWakeupFrame()`**:  
-   Updated to assemble a MAC Command frame with command ID `0x54` and MAC Command payload bytes directly: `0x01` (Wake Command) `| WakeFrameType | RendezvousTime | RI | RC | [Channel]`. If WakeupId addressing is used, a `TargetId` LTV (`kTypeTargetId=0x01`, 1–8 bytes) is appended inside the Thread Header IE 0x2d; no `WakeFrameIe` LTV is written.
+| Field | Value | Description |
+|-------|-------|-------------|
+| MAC Cmd | `0x54` | `kMacCmdDirect`; signals Thread Direct frame |
+| Thread Cmd | `0x01` | `kThreadMacCmdWake` |
+| Wake Type | `0x00` | `kWakeFrameTypeDirectLink`; standard handshake |
+| Rendezvous Time | uint8 | Offset in 10-symbol units; first Connection Window offset |
+| RI | 4 bits | Retry Interval; upper nibble of byte 4 |
+| RC | 4 bits | Retry Count; lower nibble of byte 4 |
 
-   The existing Multipurpose frame path **is retained** under the compile guard `OPENTHREAD_CONFIG_CPL_USE_LEGACY_WAKEUP_FRAME`. When that guard is enabled, a runtime boolean (e.g., `mUseCplFrameFormat` in `WakeupTxScheduler`) selects which format to use. Both `IsWakeupFrame()` and `GenerateWakeupFrame()` contain guarded branches for each format.
+**`WakeupTxScheduler::PrepareWakeupFrame()` changes:**
+- Calls `TxFrame::GenerateThreadDirectWakeCommand()` (new) instead of the removed `GenerateWakeupFrame()`.
+- Sets `KeyIdMode=1`, `KeyIndex=kDefaultWakeKeyIndex` (129), Wake Channel = 20.
+- Unicast-by-ExtAddress: `DstAddr` = WL extended address; no TargetId LTV.
+- WakeupId wake: `DstAddr` = 0xFFFF (broadcast); TargetId LTV written inside Thread Header IE 0x2d.
 
-3. **New `TxFrame::GenerateCpLinkCommand()`**:  
-   Generates the WL → WI CP Link Command (Thread MAC Command ID = `0x02`). Encodes the mandatory short address, optional supervision interval, and services bitmap in the MAC Command payload; SCA IE and Challenge IE go in the Thread Header IE 0x2d.
+**Functions removed from `mac_frame.hpp/.cpp`:**
+- `GenerateWakeupFrame()` — Multipurpose frame generator, no longer needed.
+- `IsWakeupFrame()` — replaced by `IsTdWakeCommand()`.
 
-4. **`Frame::GetThreadMacCommandId()`**:  
-   Returns the Thread MAC Command ID byte (byte 1 of the MAC Command payload, after `0x54`) when `GetType() == kTypeMacCmd`, `kErrorParse` otherwise.
-
-### 2.2  Thread Header IE (Element ID = 0x2d)
-
-The spec defines a new standard Header IE with element ID `0x2d` that carries LTV-encoded CPL-specific elements. (Not to be confused with the already existing `ThreadIe`, which is a Vendor IE with Thread Company OUI).
-
-The new IE is a short-form Header IE in the non-IETF space.
-
-New class in `mac_header_ie.hpp`:
-
+**New `mac_frame.hpp/.cpp` functions:**
 ```cpp
-/**
- * Implements the Thread Header IE (IEEE 802.15.4 Header IE, element ID = 0x2d).
- *
- * The payload is a sequence of LTV-encoded elements (Thread §16.6).
- */
-class ThreadHeaderIe
+// Returns true if this is a MAC Command 0x54 frame.
+bool Frame::IsThreadDirectMacCommand() const;
+
+// Returns the Thread MAC Command ID (byte 1 of MAC Command payload),
+// or kErrorParse if not a 0x54 frame.
+Error Frame::GetThreadMacCommandId(uint8_t &aId) const;
+
+// Returns true if this is a Wake Command (Thread MAC Cmd 0x01).
+bool Frame::IsTdWakeCommand() const;
+
+// Builds a Wake Command frame in aFrame.
+static void TxFrame::GenerateThreadDirectWakeCommand(TxFrame           &aFrame,
+                                            uint8_t            aWakeFrameType,
+                                            uint8_t            aRendezvousTime,
+                                            uint8_t            aRi,
+                                            uint8_t            aRc,
+                                            const uint8_t     *aTargetId,    // NULL = no TargetId LTV
+                                            uint8_t            aTargetIdLen); // length in bytes (1-8)
+
+// Builds a TD Link Command frame in aFrame (see §4.3).
+static void TxFrame::GenerateThreadDirectLinkCommand(TxFrame             &aFrame,
+                                            uint16_t             aShortAddr,
+                                            uint16_t             aSupervisionIntervalMs,
+                                            uint8_t              aServicesBitmap,
+                                            const ScaParams         *aSca,         // NULL = no SCA LTV
+                                            const ChallengeLtv   &aChallenge);
+```
+
+### 4.3 TD Link Command frame (Thread MAC Cmd 0x02)
+
+> **Latest chapter 16 alignment note:** short-address support is currently deferred/reserved in the active spec direction. For shipped and near-term scope, use the extended-address path and treat short-address handling as future spec follow-up.
+
+```
+[ MHR: FCF | Seq | DstPAN | DstAddr | SrcAddr | SrcPAN ]
+[ Aux Security Header: same key type that secured the received Wake Frame ]
+[ Header IEs:
+    Thread Header IE (0x2d):
+        SCA LTV (Type=0x02)      — RECOMMENDED; see §4.4
+        Challenge LTV (Type=0x03) — MANDATORY; see §4.5
+]
+[ MAC Command Payload — see RFC bit diagram below ]
+[ MFR: MIC-32 | FCS ]
+```
+
+**MAC Command Payload (all optional fields present):**
+
+```
+ 0                   1                   2
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  MAC Cmd 0x54 |Thread Cmd 0x02| Mask (8b) |SI |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Services (8b)|
++-+-+-+-+-+-+-+-+
+```
+
+| Field | Conditional | Description |
+|-------|-------------|-------------|
+| MAC Cmd | — | `0x54` (`kMacCmdDirect`) |
+| Thread Cmd | — | `0x02` (`kThreadMacCmdDirectLink`) |
+| Link Parameter Mask | — | 8-bit bitmask; bit 0 = supervision interval, bit 1 = services, bit 2 = reserved (future short address, must be 0) |
+| Supervision Interval | bit 0 of mask | uint8; maximum idle time in units of 100 ms before link supervision must be sent |
+| Services | bit 1 of mask | uint8 bitmap; bit 0 = SRP server present |
+
+Short-address support is fully deferred: the Short Address field has been removed from the TD Link Command payload in the current spec baseline (SPEC-1365). The bit for Short Address in the Link Parameter Mask is reserved and must be zero. When the Link Parameter Mask is absent or all zero bits, the command consists only of the Command byte and exchanges SCA LTVs via Header IEs only.
+
+**Enh-ACK reply from WI (Thread MAC Cmd 0x02 flow):**
+```
+[ MHR: FCF (AR=0, Frame Type=ACK) | Seq ]
+[ Header IEs:
+    Thread Header IE (0x2d):
+        SCA LTV (Type=0x02)       — WI's own SCA schedule (when WI has a constrained
+                                    receive schedule; spec permits WI to include
+                                    SCA LTV in any frame including Enh-ACK)
+        Challenge LTV (Type=0x03) — VERBATIM COPY of the Challenge LTV received
+                                    in the TD Link Command.  The WI does NOT
+                                    recompute the HMAC; it echoes the bytes.
+]
+[ MFR: MIC-32 | FCS ]
+```
+
+The WI pushes the echoed Challenge LTV bytes to the platform before the Enh-ACK turnaround deadline via `otPlatRadioConfigureThreadDirectEnhAckIe()` (§10.1). The platform injects the Thread Header IE into the hardware-generated Enh-ACK.
+
+### 4.4 Thread Header IE (Element-ID = 0x2d)
+
+A new standard IEEE 802.15.4 Header IE with Element-ID `0x2d` (spec §16.5.7.2). Its payload is a sequence of LTV-encoded elements.
+
+> Note: This is distinct from the existing `ThreadIe` (Vendor IE with Thread OUI). The new IE uses a dedicated Element-ID in the non-IETF Header IE space.
+
+Struct in `mac_header_ie.hpp`:
+```cpp
+struct ThreadHeaderIe
 {
-public:
     static constexpr uint8_t kHeaderIeId = 0x2d;
 
-    // LTV element type codes (Thread spec §16.5.7.2 / §16.7.2 / §16.10.3)
-    enum ElementType : uint8_t
-    {
-        kTypeTargetId    = 0x01, ///< Target ID LTV (WakeupId filter; spec §16.5.7.5 + §16.5.6)
-        kTypeScaIe       = 0x02, ///< Scheduled Channel Access IE (SLW schedule; spec §16.10.3)
-        kTypeChallengeIe = 0x03, ///< Thread Challenge IE (HMAC-SHA256; spec §16.7.2)
-    };
-
-    static constexpr uint8_t kMinIeSize = sizeof(HeaderIe);
+    static constexpr uint8_t kTypeTargetId  = 0x01; ///< Target ID LTV (WakeupId filter)
+    static constexpr uint8_t kTypeSca       = 0x02; ///< Scheduled Channel Access LTV
+    static constexpr uint8_t kTypeChallenge = 0x03; ///< Thread Challenge LTV
 };
 ```
 
-#### Wire Format and Struct Model
+#### LTV encoding
 
-Each LTV element in the Thread Header IE payload has the form `[L] [T] [V…]`:
+Each element uses the packed LTV format: `[L][T][V…]` where L is the byte-length of V, T is the type, and V is the value field.
 
-- **L** — Length of the Value field in bytes. In the packed LTV format (§16.5.7.3) the number of bits used for L adapts as the remaining IE content shrinks, and unused Length bits carry bits of T in the same leading byte. Logically L and T are always separate.
-- **T** — Type byte: `0x01` = Target ID, `0x02` = SCA IE, `0x03` = Thread Challenge.
-- **V** — The type-specific value bytes; the T and L bytes are **not** part of this.
+**Target ID LTV (Type = 0x01)**
 
-The packed structs below model **only the V (Value) bytes**. The T and L bytes never appear in the struct — the serialization helpers supply them externally:
-- `kType` constants are passed to the serializer to write (or match) the T byte.
-- The length (L) is evaluated based on each packed struct below (see comments).
+V = 1–8 bytes of the raw WakeupId value (low bytes of `uint64_t`, variable length). No fixed packed struct; serializer writes the minimum number of significant bytes.
 
-The LTV elements modelled as packed structs:
+**SCA LTV (Type = 0x02)**
+
+The in-memory representation is `ScaParams` (not a packed wire struct). The serializer encodes/decodes the packed wire format from these fields:
 
 ```cpp
-///////////////////////////////
-// Type=0x01: Target ID LTV (spec §16.5.7.5 + §16.5.6)
-// V field: 1–8 bytes — the raw WakeupId bytes (variable length).
-// No packed struct is defined for this type because the V field has no fixed layout:
-// the WakeupId length is 1–8 bytes depending on how many significant bytes the
-// WakeupId uses. The serializer writes the low bytes of the uint64_t WakeupId
-// directly as the V field, with L set to the actual byte length. The parser reads
-// L bytes and zero-extends back to uint64_t.
-//
-// kTypeTargetId = 0x01 is defined in the ElementType enum above.
-
-///////////////////////////////
-// Type=0x02: SCA IE (Scheduled Channel Access, spec §16.10.3)
-// V field: Variable length.
-//   2 bytes  (fixed) : mRamHeader
-//     bits [15:5]  RAM Offset   (11 bits, signed µs offset to start of radio schedule)
-//     bits  [4:0]  RAM Duration (5-bit enum):
-//                    0  = No change to previous RAM
-//                    1  = No CoEx constraints (RAM Bits field absent)
-//                    2–31 = Bitmap length; RAM Bits field present (1–4 bytes follow)
-//   0–4 bytes (variable) : RAM Bits (only when RAM Duration >= 2)
-//   0 or 3 bytes (optional) : SLW Period (12 bits) + SLW Phase (12 bits)
-//                    May be omitted when the intent is to update RAM only.
-//
-//   Notes:
-//   1. The struct below models only the fixed-prefix + SLW case (RAM Duration 0 or 1,
-//      SLW fields present). The serializer/parser must inspect and retrieve the RAM
-//      Duration bits.
-//   2. SCA teardown is signalled by L = 0 (empty payload).
-OT_TOOL_PACKED_BEGIN
-struct ScaIe
+struct ScaParams
 {
-    static constexpr uint8_t kType = 0x02;
+    static constexpr uint8_t kRamDurationNoChange      = 0;  // no change to prior RAM
+    static constexpr uint8_t kRamDurationNoConstraints = 1;  // device has no CoEx constraints
+    static constexpr uint8_t kRamDurationMax           = 31;
+    static constexpr int16_t kRamOffsetUsMin           = -1024;
+    static constexpr int16_t kRamOffsetUsMax           = 1023;
 
-    uint16_t mRamHeader;       // bits [15:5]=RAM Offset, bits [4:0]=RAM Duration
-    // Variable RAM Bits (0–4 bytes) belong here in the wire format but cannot be
-    // expressed in the fixed packed struct — see serializer.
-    uint8_t  mSlwFields[3];    // 24 bits: [23:12]=SLW Period, [11:0]=SLW Phase (160 µs units)
-} OT_TOOL_PACKED_END;
-
-///////////////////////////////
-// Type=0x03: Thread Challenge IE (spec §16.7.2)
-// V field: kLength bytes of challenge material.
-// kLength = 16: design choice for HMAC-SHA256 truncation length.
-// The serializer writes L = kLength in the LTV header.
-OT_TOOL_PACKED_BEGIN
-struct ChallengeIe
-{
-    static constexpr uint8_t kType   = 0x03;
-    static constexpr uint8_t kLength = 16;
-    uint8_t mChallenge[kLength];
-} OT_TOOL_PACKED_END;
-///////////////////////////////
+    uint16_t mSlwPeriodSlots;   // SLW Period in 160 us slots (0 = no SLW schedule)
+    uint16_t mSlwPhaseSlots;    // SLW Phase in 160 us slots
+    int16_t  mRamOffsetUs;      // RAM Offset in us, signed [-1024, 1023]
+    uint8_t  mRamDuration;      // 0 = no change, 1 = no constraints, 2-31 = bitmap length
+    uint8_t  mRamBits[4];       // valid bytes: ceil((mRamDuration+1)/8) when mRamDuration >= 2
+};
 ```
 
-Helper methods can be added to `Mac::Frame` and `Mac::TxFrame` for reading/writing these LTV elements within a `ThreadHeaderIe` payload:
+SCA teardown = SCA LTV with L = 0 (empty payload). When `OPENTHREAD_CONFIG_THREAD_DIRECT_COEX_ENABLE = 0` (default): generators always emit `mRamDuration = 1`, `mRamBits` absent, SLW fields present.
 
-- `Frame::GetThreadHeaderIe() const`
-- `Frame::GetScaIe(ScaIe &) const`
-- `Frame::GetChallengeIe(ChallengeIe &) const`
-- `TxFrame::AppendThreadHeaderIe(const ScaIe *, const ChallengeIe *)`
+> **Spec note (open item #11):** The spec introduced a new SCA LTV wire format (commit `6c6a22a`) that adds a "Slot Duration" field (2 bits, values: 0=625µs, 1=1.25ms, 2=625ms, 3=1.25s) and a "RAM Available" bit gating the RAM fields. This new format has not been implemented — the implementation uses the original `mRamHeader` encoding with implicit 160µs slot unit. Track this as open item #11 below.
 
-### 2.3  Wake Frame Security and Key Derivation
+**Challenge LTV (Type = 0x03)**
 
-The spec (§16.5.9) defines a dedicated **Wake Key** for securing the communication between a WI and a WL. This is a **new key material requirement** distinct from the existing network MAC keys.
+```cpp
+struct ChallengeLtv
+{
+    static constexpr uint8_t kLength = 16; // truncated HMAC-SHA256 (first 16 bytes)
+    uint8_t mChallenge[kLength];
+};
+```
 
-#### 2.3.1  Motivation: Guest Access
+**Helper methods on `Mac::Frame` / `Mac::TxFrame`:**
+```cpp
+// Reader helpers (return kErrorNone / kErrorNotFound / kErrorParse)
+Error Frame::GetThreadHeaderIe(OffsetRange &aRange) const;
+Error Frame::GetScaParams(ScaParams &aScaParams) const;
+Error Frame::GetChallengeLtv(ChallengeLtv &aChallengeLtv) const;
+Error Frame::GetTargetId(uint64_t &aTargetId) const;
 
-The guest access use case requires that the Network Key (and its derived link-layer keys) is **not** shared with the CP Device acting as guest. A Wake Key is therefore independently generated and distributed only to CP Device peers, keeping Thread network credentials isolated from the Wake signaling channel.
+// Writer helper
+void TxFrame::AppendThreadHeaderIe(const ScaParams    *aSca,       // NULL = omit
+                                    const ChallengeLtv *aChallenge, // NULL = omit
+                                    const uint64_t     *aTargetId); // NULL = omit
+```
 
-#### 2.3.2  Default Wake Key Derivation
+### 4.5 Challenge LTV and HMAC computation
 
-For WLs that are commissioned with the Network Key (the common case), a network-wide default Wake Key is derived as:
+The WL generates a challenge and carries it in the TD Link Command Challenge LTV. The WI echoes it verbatim in the Enh-ACK.
+
+**WL computes (spec §16.7.2–16.7.3):**
+```
+Challenge = HMAC-SHA256(Key, LinkFC ‖ WakeFC ‖ WakeID ‖ LinkSeq)[0:15]
+```
+
+where:
+- `Key` = the key that secured the received Wake Frame (Wake Key or current MAC Key — see §5.2)
+- `LinkFC` = the frame counter to be used in the TD Link Command (big-endian uint32)
+- `WakeFC` = the frame counter from the received Wake Frame (big-endian uint32)
+- `WakeID` = 8 bytes; zero-padded if the Wake Frame carried no WakeupId (**see §13 item 4**)
+- `LinkSeq` = the TD Link sequence number (uint8)
+
+**WI verifies:** computes the same HMAC with its own known values; compares to received Challenge LTV. Then immediately pushes the **received** Challenge LTV bytes to the platform for Enh-ACK injection (not the recomputed value).
+
+**WL verifies echo:** confirms the Enh-ACK Challenge LTV bytes match the bytes WL originally sent.
+
+```cpp
+// In DirectHandler:
+void DirectHandler::ComputeChallenge(ChallengeLtv        &aOut,
+                                     uint32_t             aLinkFc,
+                                     uint32_t             aWakeFc,
+                                     uint64_t             aWakeId,
+                                     uint8_t              aLinkSeq,
+                                     bool                 aUseWakeKey);
+```
+
+---
+
+## 5. Key Derivation
+
+### 5.1 Default Wake Key
+
+The default Wake Key is derived from the Thread Network Key and stored at Key Index 129:
 
 ```
 defaultWakeKey = HMAC-SHA256(thrNetworkKey, "Thread-Wake")
 ```
 
-This is directly analogous to the existing `ComputeKeys()` in `KeyManager`, which derives MAC keys via `HMAC-SHA256(NetworkKey, keySequence || "Thread")`.
+This follows the same pattern as the existing `ComputeKeys()` / `ComputeTrelKey()` in `KeyManager`.
 
-The default Wake Key is installed as **Key Index 129** in Key Identifier Mode 1.
+**`KeyManager` additions (`key_manager.hpp/.cpp`):**
 
-#### 2.3.3  Key Index Ranges
+```cpp
+// Constants
+static constexpr uint8_t kDefaultWakeKeyIndex = 129;
+static const uint8_t     kWakeKeyString[];          // "Thread-Wake" (11 bytes)
 
-| Key range | Key Index values | Usage |
+// Methods
+void           ComputeWakeKey(Mac::Key &aWakeKey) const;
+const Mac::Key &GetDefaultWakeKey(void); // cached; invalidated when NetworkKey changes
+
+// Internal state
+Mac::Key  mDefaultWakeKey;
+bool      mWakeKeyValid;   // false = needs recompute
+```
+
+Cache is invalidated inside `SetNetworkKey()`. `GetDefaultWakeKey()` returns the cache, recomputing lazily if `!mWakeKeyValid`.
+
+### 5.2 Key Selection Rules
+
+A WL accepts Wake Frames secured with **either** the Wake Key **or** the current MAC Key. This is required for the guest-access use case where the WL may not have the Network Key.
+
+The key that secured the Wake Frame MUST be used for all subsequent frames in the same TD link establishment exchange (TD Link Command, Enh-ACK, and the Challenge HMAC computation).
+
+`DirectHandler` records `mWakeKeyUsed : bool` and `mWakeKeyIndex : uint8_t` from the received Wake Frame's Aux Security Header, and passes this context to `GenerateThreadDirectLinkCommand()` and `ComputeChallenge()`.
+
+### 5.3 Key Index Ranges
+
+| Range | Key Index | Usage |
 |---|---|---|
 | Network-derived MAC keys | [0, 128] | Normal Thread MAC security |
-| Default Wake Key | 129 | Derived from NetworkKey as above |
-| Additional Wake Keys | [130, 192] | Individually provisioned Wake Keys |
-| Group Wake Keys | KeyIdMode2 | Wake frame addressed to a group of CP Devices |
+| Default Wake Key | 129 | `HMAC-SHA256(NetworkKey, "Thread-Wake")` |
+| Guest Wake Keys | [130, 192] | Individually provisioned; see §5.4 |
 | Reserved | [193, 255] | Future use |
 
-#### 2.3.4  `KeyManager` Changes
+### 5.4 Guest Wake Key Provisioning
 
-`KeyManager` gains a Wake Key derivation method modeled on the existing `ComputeKeys()` / `ComputeTrelKey()` pattern:
+**Motivation.** The default Wake Key (Key Index 129) is derived from the Thread Network Key. Any device that holds the Network Key can therefore act as a Wake Initiator. The **guest wake key** use case exists for WI devices that do *not* hold the Thread Network Key — for example, a companion phone acting as a WI through a BLE→Thread bridge. A guest wake key is a raw 16-byte key provisioned out-of-band (BLE pairing, app-layer exchange, factory provisioning) and shared only between the WI and the specific WL(s) it is permitted to wake.
 
-```cpp
-// In key_manager.hpp
-void ComputeWakeKey(Mac::Key &aWakeKey) const;
-const Mac::Key &GetDefaultWakeKey(void);  // cached; recomputed when NetworkKey changes
+**This is not deferred.** Guest wake key storage and the public API to provision it are implemented in **PR 1** as part of initial wake security modeling, alongside the default Wake Key derivation.
 
-// New member state:
-Mac::Key mDefaultWakeKey;    // HMAC-SHA256(NetworkKey, "Thread-Wake"), Key Index 129
-bool     mWakeKeyValid;      // invalidated when NetworkKey changes via SetNetworkKey()
+#### Config flags
 
-static constexpr uint8_t kDefaultWakeKeyIndex = 129;
-static const uint8_t     kWakeKeyString[];      // "Thread-Wake" (11 bytes)
-```
+```c
+// src/core/config/thread_direct.h
 
-```cpp
-// In key_manager.cpp
-const uint8_t KeyManager::kWakeKeyString[] = {
-    'T', 'h', 'r', 'e', 'a', 'd', '-', 'W', 'a', 'k', 'e',
-};
-
-void KeyManager::ComputeWakeKey(Mac::Key &aWakeKey) const
-{
-    Crypto::HmacSha256        hmac;
-    Crypto::Key               cryptoKey;
-    Crypto::HmacSha256::Hash  hash;
-
-#if OPENTHREAD_CONFIG_PLATFORM_KEY_REFERENCES_ENABLE
-    cryptoKey.SetAsKeyRef(mNetworkKeyRef);
-#else
-    cryptoKey.Set(mNetworkKey.m8, NetworkKey::kSize);
+/** Enable guest wake key support. Default ON (feature is in scope for PR 1). */
+#ifndef OPENTHREAD_CONFIG_THREAD_DIRECT_GUEST_WAKE_KEY_ENABLE
+#define OPENTHREAD_CONFIG_THREAD_DIRECT_GUEST_WAKE_KEY_ENABLE 1
 #endif
 
-    hmac.Start(cryptoKey);
-    hmac.Update(kWakeKeyString, sizeof(kWakeKeyString));
-    hmac.Finish(hash);
-
-    static_assert(sizeof(aWakeKey.m8) <= sizeof(hash.m8));
-    memcpy(aWakeKey.m8, hash.m8, sizeof(aWakeKey.m8));
-}
+/** Maximum number of simultaneously configured guest wake keys per device. */
+#ifndef OPENTHREAD_CONFIG_THREAD_DIRECT_MAX_GUEST_WAKE_KEYS
+#define OPENTHREAD_CONFIG_THREAD_DIRECT_MAX_GUEST_WAKE_KEYS 4
+#endif
 ```
 
-`GetDefaultWakeKey()` returns the cached `mDefaultWakeKey`, recomputing if `!mWakeKeyValid`. The cache is invalidated in `SetNetworkKey()`.
+#### KeyManager storage
 
-#### 2.3.5  Wake Frame Security Processing
+`KeyManager` gains a flat array of guest wake key slots (guarded by `OPENTHREAD_CONFIG_THREAD_DIRECT_GUEST_WAKE_KEY_ENABLE`):
 
-The spec (§16.6) mandates that a WL MUST accept Wake Frames secured by **either**:
-- Its Wake Key (guest access scenario), OR
-- A valid MAC Key derived from the Network Key.
+```cpp
+// key_manager.hpp
 
-The key used in the Wake Frame determines the security context for the subsequent CP Link Command and Enh-ACK:
-- **Wake Key was used** → all subsequent CP Link messages use the Wake Key.
-- **MAC Key was used** → all subsequent CP Link messages use the Current MAC Key.
+#if OPENTHREAD_CONFIG_THREAD_DIRECT_GUEST_WAKE_KEY_ENABLE
+struct GuestWakeKeyEntry
+{
+    Mac::Key mKey;       ///< 16-byte key material
+    uint8_t  mKeyIndex;  ///< Key Index in [130, 192]; 0 = slot is empty
+};
 
-`CplHandler` records which key type secured the incoming Wake Frame in `WakeupInfo`, and passes that context to `GenerateCpLinkCommand()` and `ComputeChallenge()`. `Mac::ProcessReceiveSecurity()` already performs key lookup by Key ID and Key ID Mode; the Wake Key at Key Index 129 should be found by the existing lookup automatically.
+static constexpr uint8_t kGuestWakeKeyIndexMin = 130;
+static constexpr uint8_t kGuestWakeKeyIndexMax = 192;
 
-#### 2.3.6  Key ID Mode Selection for Wake Frames (WI TX side)
+GuestWakeKeyEntry mGuestWakeKeys[OPENTHREAD_CONFIG_THREAD_DIRECT_MAX_GUEST_WAKE_KEYS];
 
-| Wake type | Key ID Mode | Key Index |
-|---|---|---|
-| Unicast (one WL) | Mode 1 | 129 (derived) or [130, 192] (provisioned) |
-| Group (multiple WLs share same key) | Mode 2 | — (no Key Index field in frame) |
+Error SetGuestWakeKey(uint8_t aKeyIndex, const Mac::Key &aKey);
+Error RemoveGuestWakeKey(uint8_t aKeyIndex);
+const Mac::Key *GetGuestWakeKey(uint8_t aKeyIndex) const; // returns nullptr if not found
+#endif
+```
 
-For the default unicast case, the WI transmits Wake Frames with `KeyIdMode=1, KeyIndex=129`. `TxFrame::GenerateWakeupFrame()` is updated to set the Key ID Mode and Key Index from the configured Wake Dataset.
+`SetGuestWakeKey()` validates that `aKeyIndex ∈ [130, 192]`, then overwrites any existing slot for that index or fills the first empty slot. Returns `OT_ERROR_NO_BUFS` if the table is full with no matching index.
+
+`GetGuestWakeKey()` is called by `Mac::ProcessReceiveSecurity()` when a received Wake Frame carries a Key Index outside [0, 128] and not equal to 129 — it looks up the guest key table and returns the key material to the decryption engine.
+
+#### Public API additions (see §9 of the OpenThread Implementation Confluence page)
+
+```c
+/**
+ * Add or replace a guest wake key at the given key index.
+ * Valid key indices: [130, 192].
+ *
+ * @param[in] aInstance   OpenThread instance.
+ * @param[in] aKeyIndex   Key Index ∈ [130, 192].
+ * @param[in] aKey        16-byte key material.
+ *
+ * @retval OT_ERROR_NONE          Key stored.
+ * @retval OT_ERROR_INVALID_ARGS  aKeyIndex out of [130, 192] range.
+ * @retval OT_ERROR_NO_BUFS       Guest key table full.
+ * @retval OT_ERROR_DISABLED_FEATURE  Feature not compiled in.
+ */
+otError otThreadDirectSetGuestWakeKey(otInstance *aInstance, uint8_t aKeyIndex,
+                             const otThreadDirectWakeKey *aKey);
+
+/**
+ * Remove a previously configured guest wake key.
+ *
+ * @retval OT_ERROR_NONE       Key removed.
+ * @retval OT_ERROR_NOT_FOUND  No key at that index.
+ */
+otError otThreadDirectRemoveGuestWakeKey(otInstance *aInstance, uint8_t aKeyIndex);
+```
+
+The WI specifies which key to use for a given wake attempt via `otThreadDirectWakeup()`:
+
+```c
+/**
+ * Initiate a wake burst targeting aExtAddress.
+ * aKeyIndex = 0 or OT_MAC_FRAME_WAKE_KEY_INDEX (129) selects the default
+ * (network-derived) Wake Key. aKeyIndex in [130, 192] selects a previously
+ * provisioned guest key. aIntervalUs = 0 / aDurationMs = 0 use the
+ * compile-time defaults from src/core/config/thread_direct.h.
+ */
+otError otThreadDirectWakeup(otInstance            *aInstance,
+                             const otExtAddress    *aExtAddress,
+                             otThreadDirectWakeType aWakeType,
+                             uint16_t               aIntervalUs,
+                             uint16_t               aDurationMs,
+                             uint8_t                aKeyIndex);
+```
+
+Calling `otThreadDirectWakeup()` with `aKeyIndex = 129` uses the default Wake Key; `[130, 192]` uses a provisioned guest key.
+
+#### Challenge HMAC with guest keys
+
+The Challenge HMAC is computed as `HMAC-SHA256(WakeKey, ...)` where `WakeKey` is the key at `mWakeKeyIndex` (whichever key the Wake Frame was secured with). `ComputeChallenge()` in `DirectHandler` calls `KeyManager::GetGuestWakeKey(mWakeKeyIndex)` when `mWakeKeyIndex != 129`, falling back to `KeyManager::GetDefaultWakeKey()` for Key Index 129. This is transparent — the HMAC computation is identical; only the key material differs.
 
 ---
 
-## 3. Stack Layer Changes
+## 6. Stack Changes: MAC Layer
 
-### 3.1  `WakeupTxScheduler` — WI Side
+### 6.1 `sub_mac_wed.cpp` — Wake Listener
 
-`WakeupTxScheduler::PrepareWakeupFrame()` is updated:
-- Calls `TxFrame::GenerateWakeupFrame()` (updated per §2.1): builds a MAC Command 0x54 frame when CPL format is selected, or a legacy Multipurpose frame when `OPENTHREAD_CONFIG_CPL_USE_LEGACY_WAKEUP_FRAME` is active and the runtime flag chooses legacy
-- Directly writes Wake Command bytes into the MAC payload: Thread MAC Command ID `0x01`, `WakeFrameType=0x00` (CP Link wake), `RendezvousTime`, then `(RI << 4) | RC` packed into **one byte** (spec §16.5.7.5: RI is bits [7:4], RC is bits [3:0] of a single octet) — follows spec §16.5.7.5 MAC payload byte layout (CPL path)
-- Sets security header: `KeyIdMode=1`, `KeyIndex=129` (default Wake Key), `FrameCounter` from MAC frame counter (CPL path)
-- **ExtAddress unicast wake:** `DstAddr` = WL's extended address. No Target ID LTV needed. Uses KeyIdMode 1.
-- **WakeupId wake (unicast-by-ID or group):** `DstAddr` = broadcast (0xFFFF). One or more Target ID LTVs (`kTypeTargetId = 0x01`, 1–8 bytes each) are appended inside the Thread Header IE 0x2d. Only WLs pre-configured with a matching WakeupId respond.
-  - *Unicast-by-ID:* a unique WakeupId identifies a single WL; uses KeyIdMode 1, Key Index [129, 192].
-  - *Group wake* (requires `OPENTHREAD_CONFIG_P2P_GROUP_WAKEUP_ENABLE`): a shared WakeupId wakes multiple WLs simultaneously; uses KeyIdMode 2 (no Key Index field). All group members share the same Wake Key. `CplHandler` must handle potentially concurrent CP Link Commands arriving from multiple WLs.
+The existing WED listen scheduling logic (`HandleWedReceiveAt`, `HandleWedReceiveOrSleep`, `UpdateWakeupListening`) is retained and renamed (WED → WL throughout) with these changes:
 
-The `WakeupRequest` type (`uint64_t WakeupId` in `provisional/link.h`) covers all three addressing cases.
+**Wake frame detection (`ShouldHandleWakeupFrame()`):**
+- Accept frames where `GetType() == kTypeMacCmd` AND the MAC Command ID byte == `0x54` AND Thread MAC Command ID (byte 1 of payload) == `0x01` (Wake Command).
+- Wake Frame Type (byte 2) is read directly from the payload to distinguish TD link wake (`0x00`) from connectionless (`0x02`).
+- WakeupId filtering (when Thread Header IE 0x2d / TargetId LTV is present): compare to the device's pre-configured WakeupId table.
 
-`GetConnectionWindowUs()` is updated to compute when the WI must stay in receive mode. Per spec §16.5.5, connection windows start at:
-
+**`WakeupInfo` struct gains fields** (in `mac_types.hpp`):
+```cpp
+struct WakeupInfo
+{
+    Mac::ExtAddress mExtAddress;       ///< WI extended address
+    uint32_t        mAttachDelayUs;    ///< Rendezvous Time → µs offset to first Connection Window
+    uint8_t         mRetryInterval;    ///< RI (4-bit wire field, stored as uint8_t)
+    uint8_t         mRetryCount;       ///< RC (4-bit wire field, stored as uint8_t)
+    uint8_t         mWakeFrameType;    ///< Wake Frame Type (0x00 / 0x01 / 0x02)
+    bool            mIsGroupWakeup;    ///< true if DstAddr was broadcast with TargetId
+    bool            mWakeKeyUsed;      ///< true = Wake Key; false = current MAC Key
+    uint8_t         mWakeKeyIndex;     ///< Key Index from the Wake Frame Aux Sec Header
+    uint32_t        mWakeFrameCounter; ///< WakeFC for Challenge HMAC input
+};
 ```
-t_k = RendezvousTime + RI × k × WAKE_INTERVAL,  k = 0, 1, …, N  (N = Retry Count)
-```
 
-The WI must keep its radio in receive from the first window (`k=0`, i.e., at `RendezvousTime`) through the last window end (`k=N`), giving a total receive span of `RI × N × WAKE_INTERVAL` plus the minimum window duration (≥3 ms per spec):
+`Mac::HandleTdWakeCommand()` extracts all WakeupInfo fields from the MAC Command payload bytes (after Thread MAC Command ID byte) and optionally from the Thread Header IE LTV.
+
+### 6.2 `WakeupTxScheduler` → `WakeupTxScheduler` — Wake Initiator
+
+File `wakeup_tx_scheduler.hpp/.cpp` is kept at its existing path (no file rename). Class is kept as `WakeupTxScheduler`.
+
+Changes inside the renamed class:
+- `PrepareWakeupFrame()` calls `TxFrame::GenerateThreadDirectWakeCommand()` (§4.2) instead of the removed `GenerateWakeupFrame()`.
+- Sets Wake Channel = `OPENTHREAD_CONFIG_THREAD_DIRECT_DEFAULT_WAKE_CHANNEL` (20).
+- `GetConnectionWindowUs()` computes the WI's total receive span from RI × RC × WAKE_INTERVAL:
 
 ```cpp
-uint32_t GetTotalConnectionWindowSpanUs(void) const
+uint32_t GetConnectionWindowUs(void) const
 {
-    // Total span from first window start to last window end  
-    // = RI × RetryCount × WAKE_INTERVAL_US + kMinWindowDurationUs
-    // RendezvousTime is the offset FROM the last Wake Frame TX to the first window —
-    // handled by the WakeupTxScheduler timer, not this function.
-    constexpr uint32_t kWakeIntervalUs    = 7500; // WAKE_INTERVAL = 7.5 ms (spec §16.12)
-    constexpr uint32_t kMinWindowDurationUs = 3000; // Minimum Connection Window = 3 ms (spec §16.5.5)
+    // Total span: RetryInterval × RetryCount × 7500 µs + minimum window (3 ms)
+    static constexpr uint32_t kWakeIntervalUs      = 7500;
+    static constexpr uint32_t kMinWindowDurationUs = 3000;
     return static_cast<uint32_t>(mRetryInterval) * mRetryCount * kWakeIntervalUs
            + kMinWindowDurationUs;
 }
 ```
 
-### 3.2  `sub_mac_wed.cpp` — Wake Listener
+### 6.3 MAC command dispatch
 
-No changes to the WED listen scheduling logic itself (`HandleWedReceiveAt` / `HandleWedReceiveOrSleep`) — these handle `OT_RADIO_CAPS_RECEIVE_TIMING` capability and software fallback already.
-
-Changes needed:
-1. **`ShouldHandleWakeupFrame()`** is already upstream (with WakeupId table filtering). The WL checks:
-   - CPL path: frame type == `kTypeMacCmd` AND IEEE 802.15.4 command ID == `0x54` AND Thread MAC Command ID (byte 1 of payload) == `0x01` (Wake Command). Optionally further filters on `WakeFrameType` == `0x00` (CP Link wake) by reading byte 2 of the MAC Command payload directly (no IE LTV lookup needed).
-   - Legacy path (when `OPENTHREAD_CONFIG_CPL_USE_LEGACY_WAKEUP_FRAME` is active): frame type == `kTypeMultipurpose` (existing behavior)
-   - If `WakeupId` is present (Thread Header IE 0x2d `TargetId` LTV for CPL; `ConnectionIe` for legacy), the WakeupId lookup runs against the pre-configured table
-
-2. **`WakeupInfo` struct** (`mac_types.hpp`) gains fields indicating which key type was used:
+`Mac::HandleMacCommand()` gains a new case:
 
 ```cpp
-struct WakeupInfo
+case Frame::kMacCmdDirect:  // 0x54 — Thread MAC Command dispatch
 {
-    ExtAddress mExtAddress;        // Extended address of WI
-    uint32_t   mAttachDelayMs;     // Rendezvous Time converted to ms (offset to first Connection Window)
-    uint8_t    mRetryInterval;     // Retry Interval (RI) — 4-bit wire field (stored as uint8_t in RAM)
-    uint8_t    mRetryCount;        // Retry Count (RC) — 4-bit wire field (stored as uint8_t in RAM)
-    bool       mIsGroupWakeup : 1; // Set if dest was broadcast with WakeupId
-    bool       mWakeKeyUsed   : 1; // true = Wake Key; false = Current MAC Key
-    uint8_t    mWakeKeyIndex;      // Key Index from the received Wake Frame security header
-};
-```
+    uint8_t threadCmdId;
+    IgnoreError(aFrame.GetThreadMacCommandId(threadCmdId));
 
-`Mac::HandleWakeupFrame()` extracts these fields (WakeFrameType, RendezvousTime, RI, RC) from the MAC Command payload bytes (after the Thread MAC Command ID byte) in place of the legacy `RendezvousTimeIe` + `ConnectionIe` approach.
-
-### 3.3  CP Link Command and `CplHandler`
-
-The final spec uses a **MAC-layer-only CP Link Command** (MAC Command 0x54, Command=2) followed by an **Enh-ACK** from the WI. The current P2P implementation, `mle_p2p.cpp` uses **MLE Link Request / Link Accept And Request** over UDP.
-
-The mapping is:
-
-| Spec step | Current upstream (MLE) | CPL chapter 16 spec (MAC-layer) |
-|---|---|---|
-| WL → WI response | MLE Link Request (UDP unicast) | MAC Cmd 0x54, Command=2 |
-| WI → WL response | MLE Link Accept And Request (UDP unicast) | Enh-ACK with Thread Header IE 0x2d Challenge |
-| WL → WI ack | MLE Link Accept (UDP unicast) | (implicit — Enh-ACK received = link established) |
-| WL data params | MLE TLVs | CP Link Command fields: supervision, services bitmap, short addr |
-
-**Decision B applied here (see §1.2)**: `CplHandler` is the spec-compliant path; the legacy MLE path remains available behind `OPENTHREAD_CONFIG_CPL_USE_LEGACY_P2P` for PoC deployments that depend on it.
-
-The new handshake can be implemented in:
-
-```
-src/core/mac/cpl_handler.hpp   // CplHandler class
-src/core/mac/cpl_handler.cpp   // 3-way handshake state machine
-```
-
-`CplHandler` is an `InstanceLocator` and `InstanceLocator::Locator<CplHandler>` inside `Instance` (guarded by `OPENTHREAD_CONFIG_P2P_ENABLE`), following the same pattern as `WakeupTxScheduler`.
-
-#### 3.3.1  `CplHandler` - Wake Initiator
-
-```
-States: kIdle → kWakingUp → kWaitingCpLinkCmd → kIdle
-```
-
-- `kWakingUp`: `WakeupTxScheduler` is running; when it ends, timer fires to close the connection window
-- `kWaitingCpLinkCmd`: WI radio is in receive; incoming MAC Command 0x54 frames are routed via `Mac::HandleMacCommand()` → new `case Frame::kMacCmdCplCommand:` → `CplHandler::HandleCplMacCommand()`
-- On CP Link Command reception:
-  1. Validate MAC security per §2.3.5 (Wake Key or current MAC Key)
-  2. Parse Thread Header IE 0x2d: short address, supervision interval, services bitmap, Challenge IE
-  3. **Immediately** push the **received** Challenge IE bytes to the PAL via `otPlatRadioConfigureCplEnhAckIe()`, so the platform can insert them verbatim in the Enh-ACK (spec §16.7.3: the WI *echoes* the challenge bytes, it does not recompute them). The Enh-ACK must go out within the ~256 µs hardware turnaround window — before the stack can complete HMAC verification. This timing constraint is the subject of Decision D (§1.2).
-  4. **Verify ex-post:** compute the expected HMAC-SHA256 (`ComputeChallenge` in §3.3.3) and compare to the received Challenge IE bytes. The Enh-ACK has already been sent at this point.
-     - If mismatch → send CPL teardown frame (per spec §16.7.1; Enh-ACK suppression is not possible after the fact)
-     - If match → proceed
-  5. Record peer in `PeerTable` with state `kStateValid`, short address, SCA schedule, supervision interval
-  6. Fire `OT_P2P_EVENT_LINKED` callback
-
-#### 3.3.2  `CplHandler` - Wake Listener
-
-```
-States: kIdle → kAttachDelay → kWaitingEnhAck → kIdle
-```
-
-- `kAttachDelay`: `mAttachDelayMs` timer scheduled; listens for additional wake frames
-- `kWaitingEnhAck`: CP Link Command has been transmitted; expecting Enh-ACK with Challenge IE
-- On CP Link Command TX completion:
-  - The Enh-ACK will arrive via `otPlatRadioTxDone(aAckFrame)` populated with the ACK frame
-  - Parse `aAckFrame` for Thread Header IE 0x2d / Challenge IE
-  - Verify challenge: per spec §16.7.3 the Enh-ACK echoes the same challenge bytes the WL sent; WL checks that the echoed value matches what it originally computed. Additionally validate MAC MIC and Frame Counter.
-  - On success: record WI in `PeerTable`, configure SCA schedule, fire `OT_P2P_EVENT_LINKED`
-  - On failure (MIC failure, Frame Counter replay, or Challenge mismatch):
-    - Discard silently per spec §16.7.1
-    - **MUST randomize the start time of the next Wake Listening window** (spec §16.7.4 — defense against Covert DoS: prevents attacker from predicting when WL will be listening again)
-    - Retry up to RetryCount, then fail
-  - **Rate limiting (spec §16.7.4):** The WL MUST NOT enforce any rate limit on incoming Wake Frames even if they fail the subsequent challenge handshake. Rate limiting would enable DoS attacks that block legitimate wakes by triggering the rate limit.
-
-`CplHandler::GenerateCpLinkCommand()` builds the frame:
-
-```cpp
-Error CplHandler::GenerateCpLinkCommand(TxFrame &aFrame, const Peer &aPeer)
-{
-    // Build MAC Command 0x54 frame with:
-    // - Command=2 (CP Link)
-    // - Short Address from our assigned range [0xfd00, 0xfdff]
-    // - Supervision interval (derived from configured SLW period)
-    // - Services bitmap (bit 0 = SRP Server present)
-    // - Thread Header IE 0x2d with Challenge IE (HMAC-SHA256 computed here)
-    // - Security matching the Wake Frame's key type (Wake Key or Current MAC Key)
-    ...
-}
-```
-
-#### 3.3.3  Challenge Computation
-
-The HMAC-SHA256 challenge uses the key that secured the incoming Wake Frame. The `WakeupInfo.mWakeKeyUsed` field (§3.2) carries this context through.
-
-Per spec §16.7.3:
-- **WL sends (Link Frame):** `Challenge = HMAC-SHA256(Key, LinkFC ‖ WakeFC ‖ WakeID ‖ LinkSeq)`
-- **WI verifies then echoes:** WI computes the same HMAC using its own known values and compares to the received challenge. If they match, WI pushes the **received bytes** (not a recomputed value) into the Enh-ACK. The Enh-ACK is not a new HMAC — it literally echoes the WL's challenge bytes back.
-- **WL verifies echo:** WL confirms the Enh-ACK's challenge bytes match what it originally sent.
-
-`ComputeChallenge()` is therefore called on both sides for **generation/verification**, but on the WI side the output is used for comparison only; the Enh-ACK IE bytes come from the received CP Link Command.
-
-> **WakeID length:** The spec defines WakeID as 1–8 bytes variable-length (§16.5.6). `WakeupId` is stored as `uint64_t` (8 bytes). When computing the HMAC, if no Wake Identifier was present, WakeID = 0 (8 zero bytes). For short WakeIDs (< 8 bytes), the spec is silent on zero-padding vs. using the exact length — this design will pad to 8 bytes. Need to verify that this is okay.
-
-```cpp
-void CplHandler::ComputeChallenge(ChallengeIe          &aOut,
-                                   uint32_t              aLinkFc,
-                                   uint32_t              aWakeFc,
-                                   const Mac::WakeupId  &aWakeId,
-                                   uint8_t               aLinkSeq,
-                                   bool                  aUseWakeKey)
-{
-    HmacSha256       hmac;
-    HmacSha256::Hash hash;
-    Crypto::Key      cryptoKey;
-
-    if (aUseWakeKey)
+    switch (threadCmdId)
     {
-        const Mac::Key &wakeKey = Get<KeyManager>().GetDefaultWakeKey();
-        cryptoKey.Set(wakeKey.m8, sizeof(wakeKey.m8));
-    }
-    else
-    {
-        // Use the current network MAC key (key material extraction follows
-        // the same pattern used by existing code in mac.cpp)
-        ...
-    }
-
-    hmac.Start(cryptoKey);
-    hmac.Update(BigEndian::HostSwap32(aLinkFc));
-    hmac.Update(BigEndian::HostSwap32(aWakeFc));
-    hmac.Update(aWakeId.m8, sizeof(aWakeId.m8)); // WakeupId (uint64_t, 8 bytes)
-    hmac.Update(aLinkSeq);
-    hmac.Finish(hash);
-
-    static_assert(sizeof(aOut.mChallenge) <= sizeof(hash.m8));
-    memcpy(aOut.mChallenge, hash.m8, sizeof(aOut.mChallenge)); // First 16 bytes
-}
-```
-
-### 3.4  `Peer` and `PeerTable` — SCA Schedule
-
-The `Peer` class (`src/core/thread/peer.hpp`) gains SCA state:
-
-```cpp
-class Peer : public CslNeighbor  // CslNeighbor already tracks CSL period and phase
-{
-    ...
-    // CPL SCA IE fields (stored after learning from CP Link Command or Enh-ACK)
-    uint16_t mSlwPeriodSlots;   ///< SLW Period in 160µs slots (0 = not yet configured)
-    uint16_t mSlwPhaseSlots;    ///< SLW Phase in 160µs slots
-    bool     mSlwCoexEnabled;   ///< Whether CoEx constraints apply (period must be multiple of 60ms)
-    bool     mHasScaSchedule;   ///< SCA IE has been received and applied
-
-    // Services
-    bool     mHasSrpServer : 1; ///< Peer advertises SRP server (services bitmap bit 0)
-
-    // CPL short address
-    uint16_t mCplShortAddress;  ///< Assigned CPL short address [0xfd00, 0xfdff], or 0xffff if unset
-    ...
-};
-```
-
-`PeerTable` is unchanged — `OPENTHREAD_CONFIG_P2P_MAX_PEERS` already controls the table size.
-
-### 3.5  Short Address Assignment
-
-The WL includes its self-assigned CPL short address in the CP Link Command. The address is selected from `[0xfd00, 0xfdff]`:
-
-```cpp
-// In CplHandler — mNextCplShortAddr is a uint16_t member of CplHandler,
-// initialized to Mac::kCplShortAddrBase in the constructor.
-// Note: a function-local static would be shared across all OT instances and
-// would not reset correctly between link teardown/re-establishment cycles.
-uint16_t CplHandler::AllocateCplShortAddress(void)
-{
-    uint16_t addr = mNextCplShortAddr;
-    mNextCplShortAddr = (mNextCplShortAddr < Mac::kCplShortAddrMax)
-                            ? (mNextCplShortAddr + 1)
-                            : Mac::kCplShortAddrBase;
-    return addr;
-}
-```
-
-Constants in `mac_types.hpp`:
-```cpp
-static constexpr uint16_t kCplShortAddrBase = 0xfd00;
-static constexpr uint16_t kCplShortAddrMax  = 0xfdff;
-```
-
-### 3.6  `CplHandler` state machine calls
-
-The CPL 3-way handshake (Wake Frame → CP Link Command → Enh-ACK) is entirely a **MAC-layer operation**. It is different from `mle_p2p.cpp`, which is **not touched** by this feature.
-
-`CplHandler::OnLinkEstablished()` calls `Get<PeerTable>().Add(peer)` directly. This follows the same cross-layer pattern already used in the `Mac` subsystem (e.g., `Mac` calls `Get<MeshForwarder>()` for TX scheduling). There is no MLE involvement in the CPL handshake path.
-
-MAC command dispatch in `Mac::HandleMacCommand()` gains a new case:
-
-```cpp
-case Frame::kMacCmdCplCommand:  // Thread MAC Command ID = 0x02, inside a 0x54 MAC Command frame
-#if OPENTHREAD_CONFIG_P2P_ENABLE
-    Get<CplHandler>().HandleCplMacCommand(aFrame);
-    didHandle = true;
+    case Frame::kThreadMacCmdWake:
+#if OPENTHREAD_CONFIG_THREAD_DIRECT_WAKE_LISTENER_ENABLE
+        HandleTdWakeCommand(aFrame);
 #endif
+        break;
+
+    case Frame::kThreadMacCmdDirectLink:
+#if OPENTHREAD_CONFIG_THREAD_DIRECT_WAKE_INITIATOR_ENABLE
+        Get<DirectHandler>().HandleTdLinkCommand(aFrame);
+#endif
+        break;
+
+    default:
+        break;
+    }
+    didHandle = true;
     break;
-```
-
-Teardown: **SCA IE with empty payload** (Length=0 in the Thread Header IE 0x2d) signals teardown per spec §16.10. `CplHandler::SendTeardown()` constructs and transmits this as a MAC Command 0x54 frame with an empty SCA LTV. The existing `otP2pUnlink()` API triggers this path.
-
-### 3.7  Post-Link Data Transfer and Supervision
-
-CPL is a **symmetric peer-to-peer link between two CP Devices** (spec §16.1, §16.3 Design Goal "Symmetric"). Both WI and WL may be sleepy and/or CoEx-constrained; neither has its radio always on. After `OT_P2P_EVENT_LINKED` fires, each side knows the peer's SLW schedule and can schedule timed transmissions into the peer's receive windows accordingly.
-
-**SCA IE exchange during handshake**
-
-- **WL → WI:** The WL's SCA IE (SLW period + phase + optional RAM) is carried in the CP Link Command (§16.8). The WI records this in `Peer.mSlwPeriodSlots` / `Peer.mSlwPhaseSlots`.
-- **WI → WL:** Per spec §16.8, the WI *may* include its own SCA IE in any frame — including the Enh-ACK and subsequent data frames. After receiving the CP Link Command, `CplHandler` on the WI side includes its own SCA IE in the Enh-ACK payload (if `OPENTHREAD_CONFIG_WAKEUP_COORDINATOR_ENABLE` is set and the WI itself has a configured SLW schedule). The WL records the WI's SLW schedule from the Enh-ACK or the first data frame.
-
-**Data TX (WI → WL)**
-
-Frames destined for the WL must arrive during the WL's SLW window. The mechanism is directly analogous to CSL enhanced indirect TX in `src/core/mac/csl_tx_scheduler.cpp`:
-
-1. `MeshForwarder` has a pending frame addressed to the WL's CPL short address.
-2. A new `CplTxScheduler` computes the next SLW window start time from `Peer.mSlwPhaseSlots` and `Peer.mSlwPeriodSlots`, using the same epoch-relative phase tracking that `CslTxScheduler::GetNextTxDelay()` uses for CSL.
-3. The frame is submitted via `Mac::RequestDirectFrameTransmission()` with a TX timestamp targeting the SLW window, with the IEEE 802.15.4 *Frame Pending* bit set if further frames are queued.
-4. The WL ACKs (clearing the pending bit when its RX queue is empty) or issues a MAC Data Poll to retrieve queued frames.
-
-**Data TX (WL → WI)**
-
-Symmetric to the above: the WL schedules outgoing frames to arrive during the WI's SLW windows, using the WI's SCA schedule learned from the Enh-ACK or a subsequent WI data frame. The WL's `CplTxScheduler` instance (on the WL side) uses `PeerSlwPeriodSlots` / `PeerSlwPhaseSlots` stored for the WI peer entry, in the same way as WI→WL.
-
-If the WI has not yet advertised its own SCA IE (i.e., the WI has no SLW schedule configured), the WL falls back to standard IEEE 802.15.4 unicast TX with MAC retries, targeting the WI's extended address. The WI is expected to have its radio open at least long enough to ACK — matching the normal OpenThread behavior for a non-sleepy device in that role.
-
-> **SLW phase reference:** The SCA IE gives period and phase in 160 µs slots but the spec draft does not define the absolute epoch reference for the phase. This is the same open issue as CSL phase tracking; resolution must be tracked against the spec and will follow the same pattern OpenThread uses for CSL phase exchange. See §8 open items.
-
-**Supervision Interval**
-
-Per spec §16.10.5: if a device does not transmit or receive a frame from its peer within the Supervision Interval, it enqueues and sends a link supervision message (MAC frame, zero-length payload, ACK requested). The spec currently states supervision frames are sent WI→WL, with a TBD note about whether the symmetric design requires both directions.
-
-This design follows the spec's current (WI→WL only) statement:
-
-- **WI side:** `CplHandler` starts a `mSupervisionTxTimer` (fires at `supervision_interval / 2` after each delivery). If no data is pending when the timer fires, `CplHandler::SendSupervisionFrame()` sends a zero-payload MAC frame to the WL's SLW window. This is directly analogous to `ChildSupervisor` (`child_supervisor.cpp`). *Note: the spec requires one supervision frame if no TX/RX occurred within the full Supervision Interval; firing at half the interval is an intentional conservative choice that sends extra keepalives at roughly 2× the required rate, trading a small overhead for earlier link-loss detection on the WL's RX timer.*
-- **WL side:** `CplHandler` starts a `mSupervisionRxTimer`, reset on each received frame from the WI. On expiry, link loss detection triggers (§16.10.6): the WL drops the connection and returns to wake listen mode (see Teardown below).
-
-**Link Loss Detection and Recovery (§16.10.6–16.10.7)**
-
-If either side fails to get an IEEE 802.15.4 ACK after `macCslMaxFrameRetries` (7) retransmissions:
-- **WL:** drops the connection, goes back to WED listen mode, fires `OT_P2P_EVENT_UNLINKED`.
-- **WI:** triggers a fresh Wake Frame transmission cycle to re-establish the link.
-
-**Teardown Conditions (§16.10.8)**
-
-| Condition | Originating side | Action |
-|---|---|---|
-| `otP2pUnlink()` called | Either | `SendTeardown()` — SCA IE with L=0; fire `OT_P2P_EVENT_UNLINKED`; remove peer from `PeerTable` |
-| Supervision RX timer expires on WL | WL | Link loss detection → drop connection; return to WED listen; fire `OT_P2P_EVENT_UNLINKED` |
-| Max retransmission failures | Either | Link loss detection → see above per role |
-| SCA teardown IE received from peer | Either | Parse empty SCA LTV; fire `OT_P2P_EVENT_UNLINKED`; remove peer from `PeerTable`; stop timers |
-
-In all cases the `Peer` entry is removed from `PeerTable`, freeing the CPL short address slot for reuse.
-
----
-
-## 4. Public API Surface
-
-### 4.1  Provisional API
-
-Some functions in `include/openthread/provisional/p2p.h` **already mirror the proposed CP Link API**:
-- `otP2pWakeupAndLink()` — WI: wake + establish links
-- `otP2pUnlink()` — either side: tear down
-- `otP2pSetEventCallback()` — event notifications (`OT_P2P_EVENT_LINKED` / `OT_P2P_EVENT_UNLINKED`)
-
-`otWakeupId` is currently defined as `uint64_t`.  The spec defines `WakeID` as an 8-byte field in the HMAC challenge, so **no type change is required.**
-
-`otP2pRequest` with new fields:
-
-```c
-typedef struct otP2pRequest
-{
-    otWakeupRequest mWakeupRequest;               ///< Wake-up request (existing).
-    uint16_t        mWakeupIntervalUs;            ///< Wake interval (0 = use config default).
-    uint16_t        mWakeupDurationMs;            ///< Wake duration (0 = use config default).
-} otP2pRequest;
-```
-
-### 4.2  New API for SCA Schedule (WL side)
-
-The WL needs to advertise its SLW schedule to the WI.  This is application-configurable:
-
-```c
-// include/openthread/provisional/p2p.h
-
-/**
- * Configures the SLW schedule that this device will advertise to Wake Initiators.
- *
- * Requires OPENTHREAD_CONFIG_WAKEUP_END_DEVICE_ENABLE.
- * A period of 0 clears the schedule (sends teardown SCA IE on next link establishment).
- *
- * @param[in] aInstance        The OpenThread instance.
- * @param[in] aSlwPeriodSlots  SLW Period in 160µs slots (must be multiple of 375 for CoEx,
- *                              or multiple of 250 for non-CoEx; spec §16.9.1).
- * @param[in] aSlwPhaseSlots   SLW Phase in 160µs slots.
- */
-otError otP2pSetSlwSchedule(otInstance *aInstance, uint16_t aSlwPeriodSlots, uint16_t aSlwPhaseSlots);
-
-/**
- * Represents the SCA (Scheduled Channel Access) schedule state of a CP peer.
- */
-typedef struct otP2pScaState
-{
-    uint16_t mSlwPeriodSlots; ///< SLW Period in 160 µs slots (0 = not configured).
-    uint16_t mSlwPhaseSlots;  ///< SLW Phase in 160 µs slots.
-    bool     mHasSchedule;    ///< true if an SCA schedule has been received from this peer.
-    bool     mCoexEnabled;    ///< true if peer reported CoEx constraints in the SCA IE.
-} otP2pScaState;
-
-/**
- * Gets the SCA schedule of a CP peer.
- *
- * @param[in]  aInstance     The OpenThread instance.
- * @param[in]  aExtAddress   The peer's extended address.
- * @param[out] aState        The peer's SCA state.
- */
-otError otP2pGetPeerScaState(otInstance *aInstance, const otExtAddress *aExtAddress, otP2pScaState *aState);
-```
-
----
-
-## 5. Platform Abstraction Layer (PAL) Design
-
-### 5.1  Enh-ACK Thread Header IE Injection
-
-> **Note:** The design of this API is subject to Decision D in §1.2. The API below represents the current draft; the final form depends on which implementation option reviewers select.
-
-The spec's 3-way handshake requires the WI's **Enh-ACK** to carry a Thread Header IE 0x2d containing a `ChallengeIe`. The stack can pre-compute the IE bytes and push them to the platform to inject them into the Enh-ACK autonomously (for example, this follows the **existing `otPlatRadioConfigureEnhAckProbing()` pattern** already established in the upstream codebase for Link Metrics probing).
-
-```c
-// include/openthread/platform/radio.h
-
-/**
- * Configures the Thread Header IE data to be included in the Enh-ACK sent to
- * a specific source address.
- *
- * This API is called by the stack after computing the HMAC-SHA256 challenge response.
- * The platform MUST include the @p aIeData bytes as a Thread Header IE (element ID 0x2d)
- * in the Enh-ACK generated for the next received frame from @p aSrcExtAddress that has
- * the AckRequest bit set.
- *
- * The IE data is consumed after a single Enh-ACK. Setting @p aIeDataLength to 0 clears
- * any pending configuration for @p aSrcExtAddress.
- *
- * @note Platforms that delegate Enh-ACK generation to the RCP use the corresponding
- *       Spinel property (SPINEL_PROP_RCP_CPL_ENH_ACK_IE) to push the configuration over
- *       the transport.
- *
- * @param[in] aInstance        OpenThread instance.
- * @param[in] aSrcExtAddress   Extended address of the CP Link Command sender (peer WL).
- * @param[in] aIeData          Pointer to the Thread Header IE payload (LTV bytes only,
- *                              not including the IE header itself). May be NULL to clear.
- * @param[in] aIeDataLength    Length of @p aIeData in bytes.
- *
- * @retval OT_ERROR_NONE          Configured successfully.
- * @retval OT_ERROR_INVALID_ARGS  @p aIeDataLength exceeds platform maximum.
- * @retval OT_ERROR_NOT_CAPABLE   Platform does not support this API.
- */
-otError otPlatRadioConfigureCplEnhAckIe(otInstance         *aInstance,
-                                         const otExtAddress *aSrcExtAddress,
-                                         const uint8_t      *aIeData,
-                                         uint16_t            aIeDataLength);
-```
-
-No new radio capability bits are being introduced.
-
-**Platform implementation:**
-
-The platform can store the pre-computed IE bytes in a small per-peer buffer. When generating an Enh-ACK for an incoming frame, the platform checks whether a pending IE configuration exists for the frame's source address, appends the Thread Header IE if so, then clears the entry. For group wake (when `OPENTHREAD_CONFIG_P2P_GROUP_WAKEUP_ENABLE` is set), this can scale to a small table keyed by source address.
-
-### 5.2  MAC Command 0x54 Frame Acceptance
-
-On platforms where the MAC frame filter must be explicitly configured during WED listen mode, the platform's WED receive configuration must accept `kTypeMacCmd` frames (and optionally existing Multipurpose frames if they indicate support for the legacy method).
-
-### 5.3  WL listening
-
-WL listen windows continue to use `otPlatRadioReceiveAt()` as-is. No changes needed.
-
-### 5.4  Wake Frame TX Security
-
-The platform's transmit security path already handles KeyIdMode1 and KeyIdMode2 frames. The only change visible to the platform is that `IsWakeupFrame()` now returns true for MAC Command 0x54 frames **in addition to** the legacy Multipurpose type check (assuming both are accepted, when `OPENTHREAD_CONFIG_CPL_USE_LEGACY_WAKEUP_FRAME` is active). The key material lookup by Key Index 129 flows through the standard `Mac::ProcessTransmitSecurity()` path unchanged.
-
----
-
-## 6. Spinel Commands (NCP / RCP Architecture)
-
-### 6.1  NCP Architecture (stack on NCP, host communicates via Spinel)
-
-For the NCP case, the host application sends Spinel `PROP_VALUE_SET` / `PROP_VALUE_GET` commands over UART/SPI; the NCP translates these internally to `otP2pWakeupAndLink()` etc. and fires async `PROP_VALUE_IS` notifications back to the host for events.  The following new properties are added to Spinel, proposed under the `SPINEL_PROP_VENDOR__BEGIN` range initially and nominated for standardization as a Thread-defined property range:
-
-```
-SPINEL_PROP_THREAD_CPL__BEGIN = SPINEL_PROP_THREAD__BEGIN + 0x60  (provisional range)
-```
-
-| Property | ID | Format | Description |
-|---|---|---|---|
-| `SPINEL_PROP_THREAD_CPL_ENABLE` | +0x00 | `b` | Enable/disable CPL (mirrors `OPENTHREAD_CONFIG_P2P_ENABLE`) |
-| `SPINEL_PROP_THREAD_CPL_MAX_PEERS` | +0x01 | `S` | Max peers (read-only) |
-| `SPINEL_PROP_THREAD_CPL_WAKEUP_CHANNEL` | +0x02 | `C` | Wake channel (maps to `otLinkSetWakeupChannel`) |
-| `SPINEL_PROP_THREAD_CPL_WL_LISTEN_ENABLE` | +0x03 | `b` | Enable WL listening (`otLinkSetWakeUpListenEnabled`) |
-| `SPINEL_PROP_THREAD_CPL_WL_LISTEN_PARAMS` | +0x04 | `LL` | interval_us, duration_us (`otLinkSetWakeupListenParameters`) |
-| `SPINEL_PROP_THREAD_CPL_WI_WAKEUP` | +0x05 | `t(...)` | Trigger WI wake+link, returns done asynchronously |
-| `SPINEL_PROP_THREAD_CPL_UNLINK` | +0x06 | `E` | Trigger WL unlink by ExtAddress |
-| `SPINEL_PROP_THREAD_CPL_PEER_TABLE` | +0x07 | `A(t(...))` | Read peer table (array of peer info) |
-| `SPINEL_PROP_THREAD_CPL_EVENT` | +0x08 | `CE` | Async notify: event code + peer ExtAddress |
-| `SPINEL_PROP_THREAD_CPL_SLW_SCHEDULE` | +0x09 | `SS` | period_slots, phase_slots (`otP2pSetSlwSchedule`) |
-
-**`SPINEL_PROP_THREAD_CPL_WI_WAKEUP` format** (TLV encoded in `t()`):
-
-```
-Field         Type    Description
-WakeupType    uint8   0=ExtAddress, 1=WakeupId, 2=GroupId
-WakeupTarget  bytes   ExtAddress (8B) or WakeupId (8B) depending on WakeupType
-IntervalUs    uint16  Wake interval (0=default)
-DurationMs    uint16  Wake duration (0=default)
-```
-
-Response: `SPINEL_CMD_PROP_VALUE_IS` on `SPINEL_PROP_THREAD_CPL_EVENT` with link-done event.
-
-### 6.2  RCP Architecture (host runs OT stack, RCP is the radio)
-
-In the RCP architecture, the host stack handles all P2P / CPL logic.  The RCP only needs standard radio operations.  The **sole new Spinel property required for the RCP** is the Enh-ACK IE injection, defined as a direct parallel to the existing `SPINEL_PROP_RCP_ENH_ACK_PROBING` (at `SPINEL_PROP_RCP_EXT__BEGIN + 3`):
-
-```c
-// spinel.h — in the SPINEL_PROP_RCP_EXT range
-SPINEL_PROP_RCP_CPL_ENH_ACK_IE = SPINEL_PROP_RCP_EXT__BEGIN + 6,
-```
-
-| Property | Format | Direction | Description |
-|---|---|---|---|
-| `SPINEL_PROP_RCP_CPL_ENH_ACK_IE` | `Ed` | host → RCP | Configure Enh-ACK IE: ExtAddress (8B) + raw Thread Header IE payload bytes. (Spinel type codes: `E` = EUI-64 8-byte address, `d` = length-prefixed raw data.) |
-
-**`radio_spinel.cpp` binding** — new method maps to `otPlatRadioConfigureCplEnhAckIe()`:
-
-```cpp
-otError RadioSpinel::ConfigureCplEnhAckIe(const otExtAddress &aSrcExtAddress,
-                                           const uint8_t      *aIeData,
-                                           uint16_t            aIeDataLength)
-{
-    return Set(SPINEL_PROP_RCP_CPL_ENH_ACK_IE,
-               SPINEL_DATATYPE_EUI64_S SPINEL_DATATYPE_DATA_S,
-               aSrcExtAddress.m8,
-               aIeData, aIeDataLength);
 }
 ```
 
-**RCP firmware side**: The property handler decodes the `Ed` frame (EUI-64 + data), stores the IE bytes keyed by source address, then injects them into the next Enh-ACK generated for that peer — the same mechanism as the `SPINEL_PROP_RCP_ENH_ACK_PROBING` handler.
+---
 
-No other new Spinel properties are needed for the RCP case — all other CPL operations (wake frame TX, WED ReceiveAt, standard data TX to peer) use existing Spinel mechanisms.
+## 7. Stack Changes: Thread Direct Handler
+
+### 7.1 `DirectHandler` — new class
+
+```
+src/core/mac/direct_handler.hpp
+src/core/mac/direct_handler.cpp
+```
+
+`DirectHandler` is an `InstanceLocator`; `Instance` owns it (guarded by `OPENTHREAD_CONFIG_THREAD_DIRECT_WAKE_INITIATOR_ENABLE || OPENTHREAD_CONFIG_THREAD_DIRECT_WAKE_LISTENER_ENABLE`), following the same pattern as `CslTxScheduler`.
+
+### 7.2 Wake Initiator state machine
+
+```
+kIdle  ──[otThreadDirectWakeup()]──►  kWakingUp
+kWakingUp  ──[WakeupTxScheduler ends]──►  kWaitingTdLinkCmd
+kWaitingTdLinkCmd  ──[TD Link Command received]──►  process → kIdle (linked or failed)
+```
+
+**On TD Link Command reception** (`DirectHandler::HandleTdLinkCommand()`):
+
+1. Validate MAC security (key lookup by the key type recorded in `WakeupInfo`).
+2. Parse Thread Header IE 0x2d: extract `SupervisionInterval`, `ServicesBitmap`, `ChallengeLtv`, `ScaParams`.
+3. Push the **received** `ChallengeLtv` bytes and the WI's own SCA LTV (if a local SLW schedule is configured) to the platform immediately via `otPlatRadioConfigureThreadDirectEnhAckIe()` so they can be injected into the Enh-ACK within the hardware ACK turnaround (~192 µs). The spec permits the WI to include its SCA LTV in any frame including the Enh-ACK. See §10.1.
+4. Asynchronously (after Enh-ACK is on air): call `ComputeChallenge()` and compare to the received Challenge LTV bytes.
+   - If mismatch: send TD teardown (SCA LTV with L=0) on the same channel. The Enh-ACK has already been transmitted; this is a spec-permitted outcome (§16.7.1).
+   - If match: proceed.
+5. Create `DirectPeer` entry in `DirectPeerTable`: record `SlwPeriodSlots`, `SlwPhaseSlots`, `SupervisionIntervalMs`, `ServicesBitmap`, `ExtAddress`.
+6. Fire `OT_THREAD_DIRECT_EVENT_LINKED` callback.
+
+### 7.3 Wake Listener state machine
+
+```
+kIdle  ──[WakeupInfo received from sub_mac_wed]──►  kAttachDelay
+kAttachDelay  ──[timer expires]──►  kSendingTdLinkCmd
+kSendingTdLinkCmd  ──[TX done callback]──►  kWaitingEnhAck
+kWaitingEnhAck  ──[otPlatRadioTxDone(aAck)]──►  process → kIdle (linked or retry)
+```
+
+**On entering `kAttachDelay`:** timer set to `mWakeupInfo.mAttachDelayUs` (the Rendezvous Time). The WL continues listening for additional Wake Frames during this window.
+
+**On sending TD Link Command:** `DirectHandler::GenerateThreadDirectLinkCommand()` builds the frame:
+- Computes `ChallengeLtv` via `ComputeChallenge()`.
+- Includes its own `ScaParams` as a SCA LTV if a local SLW schedule is configured.
+- Uses the same key type that secured the received Wake Frame.
+- Does NOT include a Short Address (SPEC-1365 deferral; the mask bit is reserved/zero).
+
+**On `otPlatRadioTxDone(aAck)` with the Enh-ACK frame:**
+- Parse the Enh-ACK for Thread Header IE 0x2d / ChallengeLtv.
+- Verify: the echoed Challenge LTV bytes must exactly match what was sent. Also verify MIC and Frame Counter.
+- On success: create `DirectPeer` entry, record WI SCA schedule (from Enh-ACK SCA LTV if present — WI includes its constrained receive schedule when it has one), fire `OT_THREAD_DIRECT_EVENT_LINKED`.
+- On failure: discard silently per spec §16.7.1.
+  - **Randomize the start time of the next WL listen window** (spec §16.7.4 — defense against Covert DoS; prevents an attacker from using a known-failed challenge to predict the WL's next wake time).
+  - Retry if `RetryCount` > 0.
+
+**Anti-DoS rules (spec §16.7.4):**
+- The WL MUST NOT enforce any rate limit on incoming Wake Frames even if subsequent challenge handshakes fail. Enforcing a rate limit would allow an adversary to block legitimate wakes by triggering the limit.
+
+### 7.4 Short address allocation (deferred)
+
+Short address support is fully deferred (SPEC-1365). The Short Address field is absent from the TD Link Command payload; the mask bit is reserved and must be zero. All active scope uses extended addresses only. Do not add `AllocateTdShortAddress()` or a Short Address field to the TD Link Command in the current PR series.
+
+### 7.5 `DirectPeer` and `DirectPeerTable` (renamed from `Peer`/`PeerTable`)
+
+Files: `src/core/thread/direct_peer.hpp/.cpp`, `src/core/thread/direct_peer_table.hpp`.
+
+The existing `Peer : CslNeighbor` class is reworked with TD-specific state (no original P2P semantics retained):
+
+```cpp
+class DirectPeer : public CslNeighbor
+{
+    // SCA schedule
+    uint16_t mSlwPeriodSlots;     ///< SLW Period in 160 µs slots (0 = not configured)
+    uint16_t mSlwPhaseSlots;      ///< SLW Phase in 160 µs slots
+
+    // Post-link state
+    uint16_t mSupervisionIntervalMs; ///< Supervision Interval from TD Link Command
+    uint8_t  mServicesBitmap;     ///< Services: bit 0 = peer has SRP server
+
+    // Wake security
+    uint8_t  mWakeKeyIndex;       ///< Key Index used for this link's Wake / Link frames
+    bool     mWakeKeyUsed : 1;    ///< true = Wake Key was used
+
+    // CoEx
+    bool     mCoexEnabled : 1;    ///< true = peer reported CoEx constraints (RAM Duration > 1)
+    bool     mHasScaSchedule : 1; ///< SCA LTV has been received and applied
+
+    // Replay protection
+    uint32_t mLastWakeFrameCounter;   ///< Last accepted WakeFC (replay window tracking)
+};
+```
+
+`DirectPeerTable` size is `OPENTHREAD_CONFIG_THREAD_DIRECT_MAX_DIRECT_PEERS`.
+
+### 7.6 Teardown
+
+SCA teardown = TD Link Command / any frame with Thread Header IE 0x2d where the SCA LTV has L=0 (empty payload), per spec §16.10.
+
+`DirectHandler::SendTeardown()` constructs a MAC Command 0x54 frame with an empty SCA LTV in the Thread Header IE.
+
+`otThreadDirectUnlink()` calls `SendTeardown()`, fires `OT_THREAD_DIRECT_EVENT_UNLINKED`, removes the `DirectPeer` entry.
 
 ---
 
-## 7. CLI Extensions
+## 8. Stack Changes: Post-Link Data Transfer
 
-New CLI subcommands under `wakeup` / `p2p` follow the existing CLI pattern in `src/cli/cli.cpp`:
+### 8.0 Post-link frame security
+
+All frames on an established Thread Direct Link — including post-link SLW data frames — are secured with the **same key used to secure the Wake Frame** (spec §16.wake-frame-security: "When a Wake Key is used, the WL MUST establish the subsequent Thread Direct Link with all messages secured using the Wake Key"). For the network-wide default case this is Wake Key index 129; for guest keys it is the provisioned guest Wake Key (indices 130–192). The key index is established by the Wake Frame's Auxiliary Security Header and applies for the lifetime of the link.
+
+> **Note:** If the Wake Frame were secured with a regular Thread MAC Key (key index 0–128, derived from the Network Key), the subsequent link would instead use the Current MAC Key. In the current implementation scope, this path is not exercised — the implementation uses Wake Keys exclusively.
+
+### 8.1 `DirectTxScheduler` — new class
 
 ```
-# WI side
-p2p connect ext <extaddr> [interval_us] [duration_ms]     # otP2pWakeupAndLink (ExtAddress)
-p2p connect id <wakeupid_hex> [interval_us] [duration_ms] # otP2pWakeupAndLink (WakeupId)
-p2p disconnect <extaddr>                                  # otP2pUnlink
-
-# WL side  
-wakeup listen enable / disable
-wakeup parameters <interval_us> <duration_us>
-wakeup channel <channel>
-wakeup wakeupid add <hex64> / remove <hex64> / clear
-
-# SCA schedule (WL advertises to WI)
-p2p slw period <slots>   # SLW Period in 160µs slots
-p2p slw phase <slots>    # SLW Phase in 160µs slots
-
-# Peer table
-p2p peers                # List all valid CP peers
+src/core/mac/direct_tx_scheduler.hpp
+src/core/mac/direct_tx_scheduler.cpp
 ```
+
+Directly analogous to `csl_tx_scheduler.cpp`. Schedules data frames to land within a peer's SLW window.
+
+**For each pending frame addressed to a `DirectPeer`'s TD short address:**
+
+1. Compute delay to next SLW window start:
+   ```
+   nextWindowStart = now + SlwPeriod - ((now - SlwPhaseEpoch) % SlwPeriod)
+   ```
+   This is the same epoch-relative phase computation used by `CslTxScheduler::GetNextCslTransmissionDelay()`.
+
+2. Submit the frame via `Mac::RequestDirectFrameTransmission()` with the computed TX timestamp.
+
+3. Set the IEEE 802.15.4 **Frame Pending** bit if further frames are queued for this peer.
+
+4. The peer ACKs (with Frame Pending = 0 when its queue is empty) or issues a MAC Data Request to pull queued frames.
+
+> **SLW phase epoch reference:** The SCA LTV carries period and phase in 160 µs slots but the spec does not currently define an absolute epoch for the phase (see **§13 item 3**). This implementation will track the same epoch reference that OpenThread uses for CSL phase — the start of the first known SLW window as established at link time, which is the receive time of the TD Link Command (WI side) or the Enh-ACK (WL side). This is identical to the CSL phase-tracking approach.
+
+**Supervision frame (WI → WL direction, spec §16.10.5):**
+
+`DirectHandler` owns a `mSupervisionTxTimer` per peer, fired at `supervision_interval / 2` after each delivery. On expiry with no pending data, sends a zero-payload MAC frame targeting the peer's next SLW window. Directly analogous to `ChildSupervisor` (`child_supervisor.cpp`).
+
+On the WL side, `mSupervisionRxTimer` is reset on each received WI frame. On expiry: link loss detection → drop connection, return to WL listen mode, fire `OT_THREAD_DIRECT_EVENT_UNLINKED`.
+
+> Note: The spec's current text specifies supervision only in the WI→WL direction. **See §13 item 5** for the open question on symmetric supervision.
+
+### 8.2 Link loss and recovery (spec §16.10.6–16.10.7)
+
+If either side exhausts `macCslMaxFrameRetries` (7) without an ACK:
+
+- **WL:** drops connection, returns to WED listen mode, fires `OT_THREAD_DIRECT_EVENT_UNLINKED`.
+- **WI:** fires `OT_THREAD_DIRECT_EVENT_UNLINKED` and may trigger a fresh wake cycle if the application requests reconnection.
 
 ---
 
-## 8. Open Items Tracked Against the Spec
+## 9. Public API
 
-| Item | Spec section | Status |
+### 9.1 New public header: `include/openthread/thread_direct.h`
+
+Replaces the `provisional/p2p.h` and `provisional/link.h` headers (which are removed).
+
+```c
+// include/openthread/thread_direct.h
+
+/**
+ * @addtogroup api-thread-direct
+ *
+ * Thread Direct (Chapter 16) — MAC-layer peer-to-peer link between Thread devices.
+ *
+ * @{
+ */
+
+/* 16-byte guest wake key material (key indices 130-192). */
+typedef struct otThreadDirectWakeKey
+{
+    uint8_t m8[16];
+} otThreadDirectWakeKey;
+
+/* Peer snapshot delivered with every event callback.
+ * mWake* fields are valid on OT_THREAD_DIRECT_EVENT_WAKE_RECEIVED;
+ * mSlw*/mTd* fields on LINKED/UNLINKED. */
+typedef struct otThreadDirectPeerInfo
+{
+    otExtAddress mExtAddress;
+    uint16_t     mTdShortAddress;        ///< reserved; OT_RADIO_INVALID_SHORT_ADDR today
+    uint16_t     mSlwPeriodSlots;
+    uint16_t     mSlwPhaseSlots;
+    uint16_t     mSupervisionIntervalMs;
+    uint8_t      mServicesBitmap;
+    uint8_t      mWakeType;              ///< WAKE_RECEIVED-only
+    uint32_t     mWakeRvTimeUs;          ///< WAKE_RECEIVED-only
+    uint8_t      mWakeRetryCount;        ///< WAKE_RECEIVED-only
+    uint8_t      mWakeRetryInterval;     ///< WAKE_RECEIVED-only
+} otThreadDirectPeerInfo;
+
+typedef enum otThreadDirectEvent
+{
+    OT_THREAD_DIRECT_EVENT_LINKED        = 0,  ///< Link established
+    OT_THREAD_DIRECT_EVENT_LINK_FAILED   = 1,  ///< aPeerInfo may be NULL
+    OT_THREAD_DIRECT_EVENT_UNLINKED      = 2,
+    OT_THREAD_DIRECT_EVENT_WAKE_RECEIVED = 3,  ///< WL only
+} otThreadDirectEvent;
+
+typedef enum
+{
+    OT_THREAD_DIRECT_WAKE_TYPE_LINK           = 0,
+    OT_THREAD_DIRECT_WAKE_TYPE_POWER_OUTAGE   = 1,
+    OT_THREAD_DIRECT_WAKE_TYPE_CONNECTIONLESS = 2,
+} otThreadDirectWakeType;
+
+typedef struct otThreadDirectRamParams
+{
+    int16_t mOffsetUs;
+    uint8_t mDuration;
+    uint8_t mBits[4];
+} otThreadDirectRamParams;
+
+typedef struct otThreadDirectLocalSca
+{
+    uint16_t                mSlwPeriodSlots;
+    otThreadDirectRamParams mRam;
+} otThreadDirectLocalSca;
+
+typedef void (*otThreadDirectEventCallback)(otThreadDirectEvent           aEvent,
+                                            const otThreadDirectPeerInfo *aPeerInfo,
+                                            void                         *aContext);
+
+/* Register the event callback. */
+void otThreadDirectSetEventCallback(otInstance                 *aInstance,
+                                    otThreadDirectEventCallback aCallback,
+                                    void                       *aContext);
+
+/* (WI role) Start a wake burst. aIntervalUs / aDurationMs = 0 use defaults.
+ * aKeyIndex 0 or 129 = default Wake Key; 130-192 = provisioned guest key. */
+otError otThreadDirectWakeup(otInstance            *aInstance,
+                             const otExtAddress    *aExtAddress,
+                             otThreadDirectWakeType aWakeType,
+                             uint16_t               aIntervalUs,
+                             uint16_t               aDurationMs,
+                             uint8_t                aKeyIndex);
+
+bool otThreadDirectIsWakeBurstActive(otInstance *aInstance);
+
+/* (Either role) Initiate link teardown. Currently returns OT_ERROR_NOT_IMPLEMENTED;
+ * teardown happens via SLW inactivity or supervision timeout. */
+otError otThreadDirectUnlink(otInstance *aInstance, const otExtAddress *aExtAddress);
+
+/* (WL role) Enable / disable Wake Listener mode. */
+otError otThreadDirectWakeListenerEnable(otInstance *aInstance, bool aEnable);
+bool    otThreadDirectIsWakeListenerEnabled(otInstance *aInstance);
+
+/* (Both roles) Local SLW period this device advertises in outgoing SCA LTVs.
+ * Phase is stack-computed at frame-build time; not app-configurable. */
+otError otThreadDirectSetSlwSchedule(otInstance *aInstance, uint16_t aSlwPeriodSlots);
+
+/* Test/debug RAM override (honoured when OPENTHREAD_CONFIG_THREAD_DIRECT_COEX_ENABLE = 1). */
+otError otThreadDirectSetRamOverride(otInstance *aInstance, const otThreadDirectRamParams *aParams);
+
+/* Read back the local SLW + RAM state advertised in this device's SCA LTVs. */
+otError otThreadDirectGetLocalSca(otInstance *aInstance, otThreadDirectLocalSca *aLocalSca);
+
+/* SLW link inactivity timeout (seconds). 0 restores compile-time default. */
+uint32_t otThreadDirectGetSlwTimeout(otInstance *aInstance);
+otError  otThreadDirectSetSlwTimeout(otInstance *aInstance, uint32_t aTimeoutSeconds);
+
+/* Peer info inspection. Currently returns OT_ERROR_NOT_IMPLEMENTED;
+ * read peer state from aPeerInfo in the event callback instead. */
+otError otThreadDirectGetPeerInfo(otInstance             *aInstance,
+                                  const otExtAddress     *aExtAddress,
+                                  otThreadDirectPeerInfo *aPeerInfo);
+
+/* Guest wake key provisioning (key indices 130-192). */
+otError otThreadDirectSetGuestWakeKey(otInstance                  *aInstance,
+                                      uint8_t                      aKeyIndex,
+                                      const otThreadDirectWakeKey *aKey);
+otError otThreadDirectRemoveGuestWakeKey(otInstance *aInstance, uint8_t aKeyIndex);
+
+/**
+ * @}
+ */
+```
+
+### 9.2 Existing API removed
+
+- `include/openthread/provisional/p2p.h` — all `otP2p*` symbols removed.
+- `include/openthread/provisional/link.h` — `otWakeupId`, `otWakeupType`, `otWakeupRequest` removed.
+
+---
+
+## 10. Platform Abstraction Layer
+
+Thread Direct adds one new platform header — `include/openthread/platform/thread_direct.h` —
+and three additions to `include/openthread/platform/radio.h`. No new `otRadioCaps` bit is
+introduced; platforms that cannot support a function return `OT_ERROR_NOT_IMPLEMENTED` and the
+stack treats that as the feature being absent.
+
+### 10.1 `include/openthread/platform/thread_direct.h`
+
+| Function | Direction | Purpose |
 |---|---|---|
-| IEEE 802.15.4 MAC Command ID 0x54 formal allocation | §16.14 | Pending IEEE; using `0x54` provisional |
-| Thread MAC Command sub-namespace: Wake Frame Type 0x02 (Connectionless) vs. CP Link Command 0x02 | §16.5.7.4 gap | Gap acknowledged in spec; using `0x01`=Wake Command and `0x02`=CP Link Command in the Thread MAC Command ID field; within Wake Command payload, Wake Frame Type `0x02` (connectionless) does not collide since it is at a different byte position. Connectionless Wake is still a well-defined type per §16.5.2. |
-| Group wake TX/RX (`OPENTHREAD_CONFIG_P2P_GROUP_WAKEUP_ENABLE`) | §16.5 | Is group wake spec final? |
-| eCSL slot contention between CPL SLW windows and regular CSL windows | §16.9 | Slot algorithm needs to be finalized in spec. Can follow `GetNeededShift()` pattern |
-| Multi-protocol CoEx RAM encoding (RAM Bits) | §16.10.2 | Single-protocol path first: RAM Duration=1 (no CoEx constraints), RAM Bits absent |
-| Wake Key provisioning for guest access (custom Wake Keys outside default) | §16.5.9 | Default Wake Key (Key Index 129) covered; custom key provisioning API can be deferred |
-| WakeID HMAC input byte length: spec defines WakeID as 1–8 bytes variable length; this implementation always passes 8 bytes (zero-padded) | §16.7.3 | Track against spec clarification |
-| Replay protection: WL MUST NOT enforce rate limits on Wake Frames even if challenge fails | §16.7.4 | Behavioral requirement — must be enforced in `sub_mac_wed.cpp` WL receive path; documented in §3.3.2 |
-| Randomize listen window after failed challenge: WL MUST randomize start time of its next listen window to prevent Covert DoS | §16.7.4 | Behavioral requirement — documented in §3.3.2; implementation: add jitter to `WakeListenTimer` restart |
+| `otPlatRadioConfigureThreadDirectEnhAckIe(otInstance *, const otExtAddress *aWiExtAddress, const uint8_t *aIeData, uint16_t aIeLength)` | Stack -> platform | Pre-arm the Thread Header IE (Element-ID 0x2d) that will be injected into the Enh-ACK generated for the next AR-bit frame from `aWiExtAddress`. Keyed by ExtAddress so concurrent peers do not collide. `aIeData = NULL` / `aIeLength = 0` removes the entry. |
+| `otPlatRadioEnableThreadDirectSlw(otInstance *, uint16_t aSlwPeriod, const otExtAddress *aWiExtAddress)` | Stack -> platform | WL-side SLW receive schedule for the link with `aWiExtAddress`. `aSlwPeriod = 0` disables SLW for this peer. Units: 160 us slots. |
+| `otPlatRadioUpdateThreadDirectSlwSampleTime(otInstance *, const otExtAddress *aWiExtAddress, uint32_t aSlwSampleTime)` | Stack -> platform | Advance the next-expected SLW arrival time on the WL after each received or missed frame. `aSlwSampleTime` is in local radio-clock us (see `otPlatRadioGetNow()`). |
+| `otPlatRadioGetThreadDirectSlwAccuracy(otInstance *)` -> `uint8_t` | Platform -> stack | Worst-case clock accuracy in PPM. Used by the WI to compute SLW TX guard windows. |
+| `otPlatRadioGetThreadDirectSlwUncertainty(otInstance *)` -> `uint8_t` | Platform -> stack | Fixed SLW arrival-time uncertainty in units of 10 us. Combined with PPM accuracy to size the WI's guard window. |
+| `otPlatRadioGetThreadDirectRamParams(otInstance *, otThreadDirectRamParams *aParams)` | Platform -> stack | Read current CoEx Radio Availability Mask. Called when `OPENTHREAD_CONFIG_THREAD_DIRECT_COEX_ENABLE = 1`. Platforms without CoEx return `OT_ERROR_NOT_IMPLEMENTED` and the stack uses the override (or "no constraints") instead. |
+
+The spec permits sending the Enh-ACK before HMAC verification completes
+(*"In implementations where the challenge verification cannot be completed within the platform's
+ACK turnaround time, the Enh-ACK MAY be generated prior to completion of the Challenge check"*).
+This means the platform injects the pre-computed challenge echo immediately; the stack verifies
+the HMAC asynchronously after the Enh-ACK has been sent. Implementations that cannot meet the
+turnaround fall back to a separate data frame carrying the Thread Header IE at the cost of an
+additional frame exchange.
+
+### 10.2 Additions to `include/openthread/platform/radio.h`
+
+```c
+#define OT_MAC_FRAME_WAKE_KEY_INDEX           129
+#define OT_MAC_FRAME_GUEST_WAKE_KEY_INDEX_MIN 130
+#define OT_MAC_FRAME_GUEST_WAKE_KEY_INDEX_MAX 192
+
+/* Register the network-derived (129) or guest (130-192) wake key with the
+ * platform. Required on platforms with OT_RADIO_CAPS_TRANSMIT_SEC, since
+ * hardware encryption runs from material registered via the platform. The
+ * standard otPlatRadioSetMacKey() only carries prev/curr/next MAC keys
+ * (indices 1-128); wake keys live outside that range. aWakeKey = NULL
+ * deregisters. */
+void otPlatRadioSetWakeKey(otInstance *aInstance, uint8_t aKeyIndex,
+                           const otMacKeyMaterial *aWakeKey);
+
+/* Mirror of SubMac::mWakeFrameCounter for hardware-encrypted TX, plus the
+ * persistence/reload hooks. Same pattern as otPlatRadioGet/SetMacFrameCounter
+ * for the standard MAC frame counter. */
+void     otPlatRadioSetWakeFrameCounter(otInstance *aInstance, uint32_t aWakeFrameCounter);
+uint32_t otPlatRadioGetWakeFrameCounter(otInstance *aInstance);
+```
+
+These three constants and three functions are declared unconditionally (not under
+`OPENTHREAD_CONFIG_THREAD_DIRECT_*`) so that `radio.hpp` inline methods compile from every
+translation unit that pulls in `radio.h` via `thread.h`.
+
+### 10.3 Wake Frame reception filter
+
+On platforms where the radio MAC filter must be explicitly configured during WL listen mode,
+the platform must accept `kTypeMacCmd` (0x03) frames on Wake Channel 20 in addition to beacon
+frames. No new API is required - existing `otPlatRadioReceiveAt()` already specifies channel
+and duration; the filter configuration is platform-internal.
+
+### 10.4 `otPlatRadioReceiveAt()` - slot ID
+
+The current signature is:
+
+```c
+otError otPlatRadioReceiveAt(otInstance *aInstance, uint8_t aChannel,
+                              uint32_t aStart, uint32_t aDuration, uint8_t aSlotId);
+```
+
+Platforms distinguish TD WL listen slots from CSL slots via `aSlotId`. Slot ID values:
+
+```c
+#define OT_RADIO_SLOT_ID_CSL 0
+#define OT_RADIO_SLOT_ID_TD  1
+```
+
+The 5-argument form is the resolved API (already present in the SiLabs reference and the
+current `silabs-thread` platform implementation - see open spec item 8 in section 13).
+
+---
+
+## 11. Spinel / Co-Processor Support
+
+### 11.1 NCP (stack on co-processor)
+
+All Thread Direct Spinel properties use the prefix `SPINEL_PROP_THREAD_DIRECT_*` (single
+`THREAD_`, not `THREAD_THREAD_`). They are declared in `src/lib/spinel/spinel.h` and handled
+in `src/ncp/ncp_base.cpp` / `ncp_base_mtd.cpp`.
+
+| Property | Direction | Description |
+|---|---|---|
+| `SPINEL_PROP_THREAD_DIRECT_WAKE_CHANNEL` | Get/Set | Wake channel (default 20). Replaces the pre-spec `SPINEL_PROP_THREAD_WAKEUP_CHANNEL`. |
+| `SPINEL_PROP_THREAD_DIRECT_WAKE_LISTEN_ENABLED` | Get/Set | Enable/disable WL periodic listen. |
+| `SPINEL_PROP_THREAD_DIRECT_WAKE_LISTEN_PARAMS` | Get/Set | WL listen interval and duration (us). |
+| `SPINEL_PROP_THREAD_DIRECT_SLW_SCHEDULE` | Get/Set | Local SLW period in 160 us slots (phase is stack-computed). |
+| `SPINEL_PROP_THREAD_DIRECT_SLW_TIMEOUT` | Get/Set | SLW link inactivity timeout (seconds). |
+| `SPINEL_PROP_THREAD_DIRECT_RAM_PARAMS` | Get/Set | CoEx RAM override (test/debug). |
+| `SPINEL_PROP_THREAD_DIRECT_WAKE` | Set | Trigger WI wake burst (ExtAddress, wake type, interval, duration, key index). Async result via `LINK_EVENT`. |
+| `SPINEL_PROP_THREAD_DIRECT_WAKE_BURST_ACTIVE` | Get | True while a WI wake burst is in progress. |
+| `SPINEL_PROP_THREAD_DIRECT_UNLINK` | Set | Teardown by ExtAddress. Currently returns `NOT_IMPLEMENTED` (mirrors the stack API). |
+| `SPINEL_PROP_THREAD_DIRECT_PEERS` | Get | Snapshot of active `DirectPeer` entries. Stack wiring lands with the TD Link PR. |
+| `SPINEL_PROP_THREAD_DIRECT_GUEST_WAKE_KEY` | Set / Remove | Provision or remove a guest wake key by index (130-192). |
+| `SPINEL_PROP_THREAD_DIRECT_LINK_EVENT` | Async notify | Mirror of `otThreadDirectEventCallback` (event code + peer info). |
+| `SPINEL_PROP_THREAD_DIRECT_WAKE_FRAME_COUNTER` | Get/Set | Mirror of `SubMac::mWakeFrameCounter`, same pattern as the existing MAC frame counter property. |
+
+Removed: `SPINEL_PROP_THREAD_WAKEUP_CHANNEL` (replaced) and the pre-spec `SPINEL_PROP_THREAD_P2P_*`
+property family.
+
+### 11.2 RCP (host runs stack, RCP is radio only)
+
+All Thread Direct logic runs on the host. The only RCP-side Spinel work is exposing the new
+`platform/thread_direct.h` and `platform/radio.h` calls (Enh-ACK IE configuration, SLW schedule,
+wake key registration, wake frame counter) over Spinel - parallel to the existing
+`SPINEL_PROP_RCP_ENH_ACK_PROBING` and MAC key / frame counter properties.
+
+> **RCP support deferred.** Three architectural problems still need resolution before RCP is
+> tractable: (1) per-WI challenge selection within the ~192 us Enh-ACK turnaround in
+> one-to-many; (2) SLW window accuracy over Spinel given round-trip jitter; (3) multi-child
+> schedule coordination when N WL peers each hold independent SLW period/phase. None of these
+> block the initial WI/WL stack on the EFR32.
+
+---
+
+## 12. CLI Extensions
+
+Implemented in `src/cli/cli_td.hpp/.cpp` under the top-level command `direct`. The CLI is
+designed to be exercisable in `ot-cli` without additional tooling.
+
+### 12.1 Top-level commands
+
+```
+direct help
+direct channel [<num>]                   # get/set wake channel
+direct wake <ext> [keyIndex [type [intervalUs [durationMs]]]]
+direct wakelisten [enable|disable]
+direct wakelisten params [<intervalUs> <durationUs>]
+direct link <subcommand>
+direct unlink                            # currently returns OT_ERROR_NOT_IMPLEMENTED
+```
+
+`direct wake` arguments:
+- `keyIndex` - 0 or `OT_MAC_FRAME_WAKE_KEY_INDEX` (129) for the default Wake Key,
+  `[130, 192]` for a provisioned guest key. Default: 0.
+- `type` - 0 = link, 1 = power outage, 2 = connectionless. Default: 0.
+- `intervalUs`, `durationMs` - 0 = use compile-time defaults from `config/thread_direct.h`.
+
+### 12.2 `direct link` subcommands
+
+```
+direct link slw [<periodSlots>]          # local SLW period (160 us slots); phase is stack-computed
+direct link ram [clear|set <hex> <offsetUs> <duration>]
+direct link timeout [<seconds>]          # SLW link inactivity timeout
+direct link state                        # local role flags, listen enabled, wake channel, SLW
+direct link peers                        # currently returns OT_ERROR_NOT_IMPLEMENTED
+direct link key <idx> <32-hex>           # provision guest wake key (idx in [130, 192])
+direct link keyremove <idx>              # remove guest wake key
+```
+
+`direct link ram set` arguments mirror the SCA LTV RAM fields directly: 1-4 bytes of bitmask
+(hex), 11-bit signed offset in us, and a RAM Duration code (0 = clear, 1 = no constraints,
+2-31 = bitmap valid).
+
+### 12.3 Diagnostic / test commands
+
+The current CLI does not include the speculative `connect ext/id`, `wakeupid`, `dump rxie`,
+`sched`, `stress`, or `reset` commands from earlier drafts. Those have been folded into the
+TD Link PR backlog and will land alongside the corresponding stack functionality (notably
+`direct link peers`, which already exists as a `NOT_IMPLEMENTED` stub).
+
+## 13. Open Spec Items (TBD / Unclear)
+
+Items marked **[BLOCKING]** must be resolved before the relevant PR can be finalized.
+
+| # | Item | Notes |
+|---|------|-------|
+| 1 | **IEEE 802.15.4 MAC Command ID 0x54 formal allocation** | [BLOCKING for final upstream merge] Using `0x54` as the provisional value defined by the spec. Final upstream merge requires confirmed IEEE allocation. |
+| 2 | **Advertisement Command LTV format** | "Compressed DNS" LTV (Type=0x01) format is marked TBD in the spec. Advertisement Command frame parsing is deferred until this is specified. |
+| 3 | **SLW phase epoch reference** | Spec does not define an absolute epoch for the SLW phase. Implementation uses local clock at link establishment (same as CSL phase tracking). |
+| 4 | **WakeID byte length in Challenge HMAC** | Spec defines WakeID as 1-8 bytes variable-length. This implementation always passes 8 bytes (zero-padded) to the HMAC. Confirm whether the HMAC input should use the exact wire length or always 8 bytes. |
+| 5 | **Symmetric supervision direction** | Current spec text specifies supervision frames WI -> WL only. Spec has a note about symmetry. If both directions are required, `mSupervisionRxTimer` on the WI side and `mSupervisionTxTimer` on the WL side need to be added. |
+| 6 | **TD Link Command: Clock Accuracy/Uncertainty field** | Field listed in spec table as "Link Parameter Mask optional" but mask bit assignment is TBD. Defer until mask bit is assigned. |
+| 7 | **TD Link Command: Min Listen Duration field** | Same as item 6 - mask bit TBD. |
+| 8 | **`otPlatRadioReceiveAt()` slot ID parameter** | RESOLVED. `aSlotId` (5-arg form) is the accepted signature and is already shipped in the current platform implementation. |
+| 9 | **Group wake** | Group Wake (KeyIdMode2, shared WakeupId) is not included in the current PR series. Deferred to the post-PoC backlog. |
+| 10 | **Full CoEx / RAM Bits** | Full multi-protocol CoEx (RAM Duration > 1, variable RAM Bits bitmap) is deferred. The current path uses RAM Duration = 1 (no constraints). `OPENTHREAD_CONFIG_THREAD_DIRECT_COEX_ENABLE` gates the full path. |
+| 11 | **SCA LTV wire format stability** | The spec's SCA LTV evolved: 2-bit "Slot Duration" field, 1-bit "RAM Available" flag gating RAM fields, 16-bit SLW Period/Phase. The current implementation uses the earlier encoding (implicit 160 us slot, 12-bit Period/Phase, RAM Duration 0/1/2-31). Track when this wire format stabilizes; both forms are codec-compatible because all parser paths are always compiled in. |
+| 12 | **TD short address allocation** | TD short address allocation/ownership is unresolved in the spec. The current implementation tracks `mTdShortAddress` in `DirectPeer` but always reports `OT_RADIO_INVALID_SHORT_ADDR`; all peer addressing uses ExtAddress. Comments and APIs say "TD short address" and avoid implying ownership. |
+
+---
+
+## 14. Pull-Request Plan
+
+Each PR targets upstream `openthread/openthread`. The sequence follows a "clean base first,
+then build" principle: PR 0 removed the pre-spec artifacts so every subsequent PR lands on a
+clean surface.
+
+Spinel/NCP and CLI work is **not deferred to a separate PR** - it ships in the same PR as the
+feature it exposes. Each PR below lists its own Spinel/NCP/CLI scope.
+
+**Overall target for PRs 0-3:** Velux PoC readiness - Thread sleepy-to-sleepy, one-to-one
+wake, no CoEx. PRs 4+ extend toward mobile-platform use cases.
+
+---
+
+### PR 0 - Upstream Cleanup (COMPLETED)
+
+**Purpose:** Remove pre-spec P2P / Gen1 / Gen2 artifacts; rename existing components to TD
+terminology; leave the repo in a compilable, behavior-neutral state. No Thread Direct
+behavior is added yet.
+
+**Removes:**
+- `src/core/thread/mle_p2p.cpp`
+- `include/openthread/provisional/p2p.h`
+- `include/openthread/provisional/link.h` (`otWakeupId`, `otWakeupType`, `otWakeupRequest`)
+- `src/core/config/p2p.h`
+- `mac_frame.hpp/.cpp`: `GenerateWakeupFrame()`, `IsWakeupFrame()`
+- `mac_header_ie.hpp`: `CstIe`
+
+**Renames / restructures:**
+- `config/wakeup.h` -> `config/thread_direct.h` with all `WAKEUP_*`/`WED_*` flags renamed to `THREAD_DIRECT_*`
+- `wakeup_tx_scheduler.*` - file path kept; class `WakeupTxScheduler` kept; payload format swapped
+- `sub_mac_wed.cpp` -> WED -> WL terminology throughout (symbols and comments)
+- `peer.hpp/.cpp` -> `direct_peer.hpp/.cpp`; `Peer` -> `DirectPeer` (P2P semantics removed)
+- `peer_table.hpp` -> `direct_peer_table.hpp`; `PeerTable` -> `DirectPeerTable`
+
+**Adds:**
+- `include/openthread/thread_direct.h` - stub public API header
+
+**Spinel / NCP:**
+- `src/lib/spinel/spinel.h` - rename `SPINEL_PROP_THREAD_WAKEUP_CHANNEL` -> `SPINEL_PROP_THREAD_DIRECT_WAKE_CHANNEL`; remove pre-spec P2P property definitions
+- `src/ncp/ncp_base.cpp` - update handler for renamed wake channel property; remove P2P NCP handlers
+
+**CLI:**
+- Remove old `p2p connect/disconnect/peers` and `wakeup listen/params/channel` commands
+- Add `direct` command skeleton (`direct help`, `direct channel`, stubs for `wake`, `wakelisten`, `link`, `unlink`) - all return `OT_ERROR_NOT_IMPLEMENTED` until the wake / link PRs land
+
+**Tests:** Existing wakeup-related tests pass unchanged (behavior is not altered - the
+scheduler still fires, WL listen still works, just renamed).
+
+---
+
+### PR 1 - Wire Foundation + Secure Wake (COMPLETED)
+
+**Purpose:** Bake in all wire format definitions, IE codec, and config constants for the
+**full eventual scope** - group wake, WakeupId addressing, full CoEx/SCA with RAM bitmap,
+all LTV types, all MAC Command types. Initial callers use a narrow path (one-to-one, RAM
+Duration = 1); nothing in the wire layer needs to change later.
+
+**Files touched:**
+- `src/core/mac/mac_frame.hpp/.cpp`: `kMacCmdDirect = 0x54`, `kThreadMacCmdAdvertisement/Wake/DirectLink`, Wake Frame Type enum, `IsThreadDirectMacCommand()`, `GetThreadMacCommandId()`, `IsTdWakeCommand()`, `GenerateThreadDirectWakeCommand()`, `GenerateThreadDirectLinkCommand()`
+- `src/core/mac/mac_header_ie.hpp`: `ThreadHeaderIe` (Element-ID 0x2d), `TargetIdLtv` (variable 1-8 bytes), `ScaParams` (full RamHeader + variable RamBits + SlwFields), `ChallengeLtv` (16 bytes), and helpers
+- `src/core/config/thread_direct.h`: `DEFAULT_WAKE_CHANNEL = 20`, `SLW_MIN_DURATION_SLOTS = 8`, `MAX_DIRECT_PEERS = 1` (default - raise per product topology), `COEX_ENABLE = 0`, plus the new `SLW_TIMEOUT`, `SLW_MAX_TIMEOUT`, `LISTEN_RECEIVE_TIME_AFTER`, `WAKE_FRAME_TX_CCA_ENABLE`, `CONNECTION_RETRY_INTERVAL`, `CONNECTION_RETRY_COUNT` constants
+- `src/core/thread/key_manager.hpp/.cpp`: `kDefaultWakeKeyIndex = 129`, `ComputeWakeKey()` (HMAC-SHA256 of Network Key), `GetDefaultWakeKey()`, guest key table (indices 130-192) with `SetGuestWakeKey()` / `RemoveGuestWakeKey()` / `FindGuestWakeKey()`
+- `include/openthread/platform/radio.h`: `otPlatRadioConfigureThreadDirectEnhAckIe()`, `otPlatRadioSetWakeKey()`, `otPlatRadioSet/GetWakeFrameCounter()`, plus `OT_MAC_FRAME_*_KEY_INDEX` constants
+- `include/openthread/platform/thread_direct.h`: SLW schedule, accuracy, uncertainty, and RAM-params platform getters
+
+**Spinel / NCP:** `src/lib/spinel/spinel.h` - add the `SPINEL_PROP_THREAD_DIRECT_*` constant
+definitions enumerated in section 11.1. Handlers land alongside the corresponding stack
+functionality.
+
+**CLI:** `direct help`, `direct channel`, `direct wake`, `direct wakelisten`, `direct link slw`,
+`direct link ram`, `direct link timeout`, `direct link state`, `direct link key`,
+`direct link keyremove`, and the `NOT_IMPLEMENTED` stubs for `direct link peers` and
+`direct unlink`.
+
+**Tests:** Unit tests for `GenerateThreadDirectWakeCommand()`, `GenerateThreadDirectLinkCommand()`,
+SCA / Challenge / TargetId LTV round-trips, wake key derivation (HMAC test vectors), and wake
+frame TX/RX security including the EFR32 hardware-encryption path.
+
+---
+
+### TD Link PR (in flight) - 3-way handshake + DirectHandler lifecycle
+
+**Purpose:** Complete the MAC-layer 3-way handshake. WL responds to a Wake Frame with the TD
+Link Command; WI replies via the Enh-ACK Thread Header IE with the echoed challenge plus its
+own SCA LTV. TD link is established as a `DirectPeer` entry on both sides.
+
+**Scope:** unicast-by-ExtAddress, one-to-one wake, RAM Duration = 1 (no CoEx). Wire format is
+already general from PR 1; behavior is constrained.
+
+**Stack files:**
+- `src/core/mac/direct_handler.hpp/.cpp` - new; WI/WL state machines, `ComputeChallenge()`,
+  `SendTeardown()`, calls `otPlatRadioConfigureThreadDirectEnhAckIe()` on TD Link Command
+  receipt
+- `src/core/mac/mac.cpp` - dispatch TD Link Command (Thread MAC Cmd 0x02) into the handler;
+  narrow `Mac::IsThreadDirectLinkActive()` to "linked session only" (see thread-direct.mdc)
+- `src/core/thread/direct_peer.hpp/.cpp` - finalize TD-specific fields (mWakeKeyIndex,
+  mWakeFrameCounter, mTdShortAddress placeholder, supervision timers)
+- `src/core/instance/instance.hpp` - `Get<DirectHandler>()`
+- Wake frame counter guards widen to `WAKE_INITIATOR || WAKE_LISTENER` in `sub_mac.hpp/cpp`,
+  `radio.hpp`, and `examples/platforms/simulation/radio.c` (WL now also TXes a frame secured
+  with the wake key); WL `ProcessTransmitSecurity` / TxDone sync uses `SetWakeFrameCounter`
+  the same way WI does
+- `include/openthread/thread_direct.h` - wire `otThreadDirectUnlink`, `otThreadDirectGetPeerInfo`,
+  `otThreadDirectSetSlwSchedule`, `otThreadDirectSetSlwTimeout`, `otThreadDirectSetRamOverride`,
+  `otThreadDirectGetLocalSca` to the handler / direct_peer
+
+**Spinel / NCP:** Implement handlers for `SPINEL_PROP_THREAD_DIRECT_SLW_SCHEDULE`,
+`SLW_TIMEOUT`, `RAM_PARAMS`, `UNLINK`, `PEERS`, `WAKE_FRAME_COUNTER`, and the
+`LINK_EVENT` async stream.
+
+**CLI:** Wire `direct unlink` and `direct link peers` (currently `NOT_IMPLEMENTED`); add
+diagnostic helpers for SLW timing inspection.
+
+**Tests:**
+- Full 3-way handshake on the simulation transport (WI + WL).
+- Challenge HMAC verification pass and fail paths.
+- Teardown via supervision timeout sends empty SCA LTV.
+- DoS rule: WL accepts unlimited failed-challenge Wake Frames without rate limit.
+- Randomized WL listen window start after failed challenge / handshake.
+
+---
+
+### PR 3 - Post-Link Data Transfer + Supervision
+
+**Purpose:** SLW-aware data TX scheduler; WI supervision; WL supervision timer; link loss
+detection and cleanup.
+
+**Stack files:**
+- `src/core/mac/direct_tx_scheduler.hpp/.cpp` - new; epoch-relative SLW phase computation
+  (same shape as `CslTxScheduler::GetNextCslTransmissionDelay()`); initial RAM Duration = 1
+- `src/core/mac/direct_handler.hpp/.cpp`: `mSupervisionTxTimer` (WI), `mSupervisionRxTimer`
+  (WL); `SendSupervisionFrame()`; `HandleSupervisionTimeout()` -> `OT_THREAD_DIRECT_EVENT_UNLINKED`
+
+**Spinel / NCP:** Flesh out the `PEERS` array encoding now that peers carry full post-link SLW
+state.
+
+**CLI:** Implement `direct link peers` (live data); add a per-peer `sched` helper.
+
+**Tests:** SLW window accuracy, supervision firing intervals, supervision RX expiry, MAC
+retransmission exhaustion -> link loss on both sides.
+
+---
+
+### PR 4 - Group Wake + WakeupId (deferred)
+
+WakeupId addressing; broadcast Wake Frames with TargetId LTV; WL WakeupId filter table;
+concurrent link handling.
+
+> Deferred until the unicast path is fully validated in the field.
+
+---
+
+### PR 5 - Full CoEx / SCA (deferred)
+
+Full RAM bitmap path (`OPENTHREAD_CONFIG_THREAD_DIRECT_COEX_ENABLE = 1`); CoEx-aware SLW
+period constraints; `DirectTxScheduler` RAM-offset-aware window scheduling.
+
+> Deferred: no CoEx-constrained platform is in the initial target set. Spec stability in the
+> SCA LTV format is an additional benefit of waiting.
+
+---
+
+### PR 6 - RCP / Host Split (deferred)
+
+`SPINEL_PROP_RCP_TD_ENH_ACK_IE` plus `radio_spinel.cpp` bindings for the new platform calls;
+RCP firmware Enh-ACK IE injection handler; end-to-end test on RCP + host topology.
+
+> Deferred. Three architectural problems must be solved first: (1) per-WI challenge selection
+> within the ~192 us Enh-ACK turnaround in one-to-many; (2) SLW window accuracy over Spinel
+> given round-trip jitter; (3) multi-child schedule coordination when N WL peers hold
+> independent SLW state.
